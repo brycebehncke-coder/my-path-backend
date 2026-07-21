@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "node --env-file=.env server.mjs",
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test server.test.mjs"
   },
   "engines": {
     "node": ">=20"

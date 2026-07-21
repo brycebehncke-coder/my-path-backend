@@ -1,14 +1,19 @@
-# My Path Backend
+# AgeUp Backend
 
-This is the small backend server your iPhone app should talk to instead of storing an OpenAI API key in the app.
+This is the small backend server your iPhone app should talk to instead of storing AI provider keys in the app.
 
 ## What it does
 
-- keeps your real `OPENAI_API_KEY` on the server only
+- keeps your real `OPENAI_API_KEY` and `DEEPSEEK_API_KEY` on the server only
 - receives requests from the app at `POST /v1/chat/completions`
-- forwards them to OpenAI
+- forwards `gpt-4o-mini` to OpenAI
+- forwards `deepseek-v4-pro` directly to DeepSeek
+- disables DeepSeek thinking mode for lower latency and token cost
+- adapts the app's strict JSON schemas to DeepSeek JSON mode
+- marks DeepSeek's 01:00-04:00 and 06:00-10:00 UTC peak windows so the app charges 2x AI Tokens
 - sends the response back to the app
-- exposes `GET /v1/health/openai` so the app can verify the backend is working
+- exposes `GET /v1/health/ai?model=...` so the app can verify the selected provider
+- keeps `GET /v1/health/openai` for older builds
 
 ## First-time setup
 
@@ -25,12 +30,13 @@ cd '/Applications/My Path/backend'
 cp .env.example .env
 ```
 
-4. Open `.env` and paste your NEW OpenAI API key.
+4. Open `.env` and paste your OpenAI and DeepSeek API keys.
 
 Example:
 
 ```env
 OPENAI_API_KEY=sk-...
+DEEPSEEK_API_KEY=sk-...
 PORT=3000
 ```
 
@@ -45,7 +51,7 @@ npm run dev
 If it works, you should see something like:
 
 ```text
-My Path backend listening on http://0.0.0.0:3000
+AgeUp backend listening on http://0.0.0.0:3000
 ```
 
 ## Test the backend locally
@@ -54,9 +60,10 @@ In another Terminal window:
 
 ```bash
 curl http://127.0.0.1:3000/v1/health/openai
+curl 'http://127.0.0.1:3000/v1/health/ai?model=deepseek-v4-pro'
 ```
 
-If your key is set correctly, you should get JSON saying the backend can reach OpenAI.
+If each key is set correctly, the matching endpoint returns JSON naming its model and provider.
 
 ## Point the app at the backend
 
@@ -78,7 +85,7 @@ Then set `BACKEND_API_BASE_URL` in `/Applications/My Path/My-Path-Info.plist` to
 
 ## Important
 
-- never put the OpenAI key back into the iPhone app
+- never put either provider key into the iPhone app
 - always keep it only in `.env` on the backend
 - `.env` should never be committed or shared
 
