@@ -28,6 +28,8 @@ test('attaches peak pricing only to successful DeepSeek usage payloads', () => {
     routeForModel('deepseek-v4-pro'),
     new Date('2026-07-21T06:30:00Z'),
   );
+  assert.equal(deepSeekPayload.provider, 'DeepSeek');
+  assert.equal(deepSeekPayload.requested_model, 'deepseek-v4-pro');
   assert.equal(deepSeekPayload.usage.wallet_token_multiplier, 2);
   assert.equal(deepSeekPayload.usage.pricing_period, 'peak');
 
@@ -37,6 +39,8 @@ test('attaches peak pricing only to successful DeepSeek usage payloads', () => {
     routeForModel('gpt-4o-mini'),
     new Date('2026-07-21T06:30:00Z'),
   );
+  assert.equal(openAIPayload.provider, 'OpenAI');
+  assert.equal(openAIPayload.requested_model, 'gpt-4o-mini');
   assert.equal('wallet_token_multiplier' in openAIPayload.usage, false);
 });
 

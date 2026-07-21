@@ -42,7 +42,14 @@ function deepSeekPricingMultiplier(at = new Date()) {
 }
 
 function attachPricingMetadata(payload, route, at = new Date()) {
-  if (route.kind !== 'deepseek' || !payload?.usage || typeof payload.usage !== 'object') {
+  if (!payload || typeof payload !== 'object') {
+    return payload;
+  }
+
+  payload.provider = route.provider;
+  payload.requested_model = route.upstreamModel;
+
+  if (route.kind !== 'deepseek' || !payload.usage || typeof payload.usage !== 'object') {
     return payload;
   }
 
