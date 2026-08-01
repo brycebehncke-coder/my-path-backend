@@ -14,6 +14,9 @@ This is the small backend server your iPhone app should talk to instead of stori
 - sends the response back to the app
 - exposes `GET /v1/health/ai?model=...` so the app can verify the selected provider
 - keeps `GET /v1/health/openai` for older builds
+- verifies App Attest registrations and request assertions before protected operations
+- binds each assertion to the exact HTTP method, path, request body, and a short-lived server challenge
+- persists App Attest public keys and monotonic counters to reject replayed requests
 
 ## First-time setup
 
@@ -39,6 +42,8 @@ OPENAI_API_KEY=sk-...
 DEEPSEEK_API_KEY=sk-...
 PORT=3000
 ```
+
+Production also requires the App Attest and persistent-ledger values documented in `PLAYER_USAGE_LIMITS.md`.
 
 ## Run the backend locally
 
@@ -95,7 +100,6 @@ This is the safe minimum.
 
 Later, you should add:
 - player authentication
-- rate limits
 - ad verification
 - purchase verification
 - server-side token balance checks

@@ -20,4 +20,16 @@ PLAYER_QUOTA_SIGNING_SECRET=<a long random secret kept only in Render>
 
 Without a persistent disk, the signed Keychain receipt still prevents an ordinary player from resetting the same day's total by deleting local game data or during a backend redeploy. The disk is required for a fully server-retained deleted-account record.
 
-The system is intended to stop ordinary accidental or deliberate overuse. Strong resistance to a modified client would additionally require an authenticated account or Apple App Attest.
+The same persistent file now stores verified App Attest public keys and their latest assertion counters. A persistent disk is strongly recommended before `APP_ATTEST_ENFORCEMENT=required` is enabled. If a backend replacement loses the file, the iOS app recovers by generating and registering a new App Attest key, but repeated replacements can unnecessarily consume Apple's key-generation allowance.
+
+App Attest rollout variables:
+
+```text
+APP_ATTEST_TEAM_ID=A8S98U9VW6
+APP_ATTEST_BUNDLE_ID=com.brycebehncke.ageup
+APP_ATTEST_REQUIRED_BUILD=172
+APP_ATTEST_ENFORCEMENT=new-builds
+APP_ATTEST_ALLOW_DEVELOPMENT=false
+```
+
+Use `new-builds` while build 172 is processing so earlier TestFlight builds keep working. After build 172 is available to testers, change `APP_ATTEST_ENFORCEMENT` to `required` to prevent clients from bypassing verification by claiming an older build number.

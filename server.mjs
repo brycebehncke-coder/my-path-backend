@@ -1,8 +1,14 @@
 import { createServer } from 'node:http';
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import {
+  createHash,
+  createHmac,
+  randomBytes,
+  timingSafeEqual,
+} from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 
 const port = Number(process.env.PORT || 3000);
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
@@ -22,6 +28,33 @@ const playerUsageLedgerPath = (process.env.PLAYER_USAGE_LEDGER_PATH || '').trim(
 const playerQuotaSigningSecret = (process.env.PLAYER_QUOTA_SIGNING_SECRET || '').trim()
   || createHash('sha256')
     .update(`my-path-quota-v1\0${openaiApiKey}\0${deepSeekApiKey}`)
+    .digest('hex');
+const appAttestTeamIdentifier = (process.env.APP_ATTEST_TEAM_ID || '').trim()
+  || 'A8S98U9VW6';
+const appAttestBundleIdentifier = (process.env.APP_ATTEST_BUNDLE_ID || '').trim()
+  || 'com.brycebehncke.ageup';
+const appAttestRequiredBuild = configuredPositiveInteger(
+  process.env.APP_ATTEST_REQUIRED_BUILD,
+  172,
+  1,
+  10_000_000,
+);
+const appAttestEnforcement = normalizedAppAttestEnforcement(
+  process.env.APP_ATTEST_ENFORCEMENT,
+);
+const appAttestAllowDevelopmentEnvironment = normalizedBoolean(
+  process.env.APP_ATTEST_ALLOW_DEVELOPMENT,
+  process.env.NODE_ENV !== 'production',
+);
+const appAttestChallengeTTLMilliseconds = configuredPositiveInteger(
+  process.env.APP_ATTEST_CHALLENGE_TTL_MS,
+  10 * 60 * 1000,
+  60_000,
+  60 * 60 * 1000,
+);
+const appAttestChallengeSigningSecret = (process.env.APP_ATTEST_CHALLENGE_SECRET || '').trim()
+  || createHmac('sha256', playerQuotaSigningSecret)
+    .update('my-path-app-attest-challenge-v1')
     .digest('hex');
 let sharedPlayerUsageLedger;
 
@@ -105,6 +138,21 @@ function configuredPositiveInteger(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, Math.trunc(parsed)));
 }
 
+function normalizedBoolean(value, fallback = false) {
+  if (typeof value !== 'string' || !value.trim()) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+}
+
+function normalizedAppAttestEnforcement(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return ['off', 'new-builds', 'required'].includes(normalized)
+    ? normalized
+    : 'new-builds';
+}
+
 function playerQuotaUTCDateKey(at = new Date()) {
   return at.toISOString().slice(0, 10);
 }
@@ -172,6 +220,7 @@ class PlayerUsageLedger {
     this.filePath = filePath;
     this.dailyLimit = dailyLimit;
     this.players = new Map();
+    this.appAttestKeys = new Map();
     this.reservations = new Map();
     this.load();
   }
@@ -198,14 +247,47 @@ class PlayerUsageLedger {
         days,
       });
     }
+    for (const [keyId, rawRecord] of Object.entries(parsed.appAttestKeys || {})) {
+      const signCount = Number(rawRecord?.signCount);
+      if (typeof keyId !== 'string'
+          || keyId.length < 32
+          || keyId.length > 256
+          || !/^[A-Za-z0-9+/=_-]+$/.test(keyId)
+          || !rawRecord
+          || typeof rawRecord !== 'object'
+          || !/^[0-9a-f]{64}$/.test(rawRecord.playerHash || '')
+          || typeof rawRecord.publicKey !== 'string'
+          || !rawRecord.publicKey.includes('BEGIN PUBLIC KEY')
+          || !Number.isSafeInteger(signCount)
+          || signCount < 0) {
+        continue;
+      }
+      this.appAttestKeys.set(keyId, {
+        playerHash: rawRecord.playerHash,
+        publicKey: rawRecord.publicKey,
+        environment: rawRecord.environment === 'development' ? 'development' : 'production',
+        signCount,
+        createdAt: typeof rawRecord.createdAt === 'string'
+          ? rawRecord.createdAt
+          : new Date(0).toISOString(),
+        lastSeenAt: typeof rawRecord.lastSeenAt === 'string'
+          ? rawRecord.lastSeenAt
+          : new Date(0).toISOString(),
+      });
+    }
   }
 
   persist() {
     if (!this.filePath) return;
     mkdirSync(dirname(this.filePath), { recursive: true });
     const players = Object.fromEntries(this.players);
+    const appAttestKeys = Object.fromEntries(this.appAttestKeys);
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
-    writeFileSync(temporaryPath, JSON.stringify({ version: 1, players }), { mode: 0o600 });
+    writeFileSync(
+      temporaryPath,
+      JSON.stringify({ version: 1, players, appAttestKeys }),
+      { mode: 0o600 },
+    );
     renameSync(temporaryPath, this.filePath);
   }
 
@@ -296,6 +378,48 @@ class PlayerUsageLedger {
     this.persist();
     return this.snapshot(playerHash, day, at);
   }
+
+  appAttestKey(keyId) {
+    return this.appAttestKeys.get(keyId) || null;
+  }
+
+  registerAppAttestKey({ keyId, playerHash, publicKey, environment }, at = new Date()) {
+    const existing = this.appAttestKeys.get(keyId);
+    if (existing) {
+      if (existing.playerHash !== playerHash || existing.publicKey !== publicKey) {
+        throw new Error('This App Attest key is already registered to another player.');
+      }
+      existing.lastSeenAt = at.toISOString();
+      this.persist();
+      return { ...existing };
+    }
+
+    const record = {
+      playerHash,
+      publicKey,
+      environment: environment === 'development' ? 'development' : 'production',
+      signCount: 0,
+      createdAt: at.toISOString(),
+      lastSeenAt: at.toISOString(),
+    };
+    this.appAttestKeys.set(keyId, record);
+    this.persist();
+    return { ...record };
+  }
+
+  advanceAppAttestSignCount(keyId, expectedSignCount, nextSignCount, at = new Date()) {
+    const record = this.appAttestKeys.get(keyId);
+    if (!record || record.signCount !== expectedSignCount) {
+      throw new Error('The App Attest assertion counter is stale.');
+    }
+    if (!Number.isSafeInteger(nextSignCount) || nextSignCount <= record.signCount) {
+      throw new Error('The App Attest assertion counter did not advance.');
+    }
+    record.signCount = nextSignCount;
+    record.lastSeenAt = at.toISOString();
+    this.persist();
+    return { ...record };
+  }
 }
 
 function getPlayerUsageLedger() {
@@ -312,9 +436,220 @@ function playerQuotaIdentity(req) {
   const supplied = normalizePlayerIdentifier(req.headers['x-my-path-player-id']);
   const stableIdentifier = supplied || `legacy-ip:${creatorCodeClientAddress(req)}`;
   return {
+    identifier: supplied,
     hash: playerQuotaHash(stableIdentifier),
     isLegacy: !supplied,
   };
+}
+
+class AppAttestRequestError extends Error {
+  constructor(code, message, statusCode = 401) {
+    super(message);
+    this.name = 'AppAttestRequestError';
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+function appAttestIsRequired(req, enforcement = appAttestEnforcement) {
+  if (enforcement === 'off') return false;
+  if (enforcement === 'required') return true;
+  const build = Number(req.headers['x-my-path-client-build']);
+  return Number.isSafeInteger(build) && build >= appAttestRequiredBuild;
+}
+
+function appAttestChallengeToken(payload, secret = appAttestChallengeSigningSecret) {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = createHmac('sha256', secret).update(encoded).digest('base64url');
+  return `${encoded}.${signature}`;
+}
+
+function verifiedAppAttestChallengeToken(
+  rawToken,
+  expectedPlayerHash,
+  expectedPurpose,
+  at = new Date(),
+  secret = appAttestChallengeSigningSecret,
+) {
+  if (typeof rawToken !== 'string' || rawToken.length > 4_096) return null;
+  const parts = rawToken.trim().split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const expectedSignature = createHmac('sha256', secret).update(parts[0]).digest('base64url');
+  const providedBuffer = Buffer.from(parts[1], 'utf8');
+  const expectedBuffer = Buffer.from(expectedSignature, 'utf8');
+  if (providedBuffer.length !== expectedBuffer.length
+      || !timingSafeEqual(providedBuffer, expectedBuffer)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    if (payload?.v !== 1
+        || payload?.p !== expectedPlayerHash
+        || payload?.u !== expectedPurpose
+        || typeof payload?.c !== 'string'
+        || !/^[A-Za-z0-9_-]{43}$/.test(payload.c)
+        || typeof payload?.j !== 'string'
+        || !/^[A-Za-z0-9_-]{22}$/.test(payload.j)
+        || !Number.isSafeInteger(payload?.e)
+        || payload.e <= at.getTime()) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function issueAppAttestChallenges(
+  playerHash,
+  purpose,
+  count = 1,
+  at = new Date(),
+  secret = appAttestChallengeSigningSecret,
+) {
+  const boundedCount = purpose === 'assertion'
+    ? configuredPositiveInteger(count, 1, 1, 8)
+    : 1;
+  const expiresAt = at.getTime() + appAttestChallengeTTLMilliseconds;
+  return Array.from({ length: boundedCount }, () => {
+    const payload = {
+      v: 1,
+      p: playerHash,
+      u: purpose,
+      c: randomBytes(32).toString('base64url'),
+      j: randomBytes(16).toString('base64url'),
+      e: expiresAt,
+    };
+    return {
+      challenge: payload.c,
+      challenge_token: appAttestChallengeToken(payload, secret),
+      expires_at_ms: expiresAt,
+    };
+  });
+}
+
+function decodedBase64Value(rawValue, maximumBytes) {
+  if (typeof rawValue !== 'string'
+      || rawValue.length === 0
+      || rawValue.length > Math.ceil(maximumBytes * 4 / 3) + 8
+      || !/^[A-Za-z0-9+/=_-]+$/.test(rawValue)) {
+    return null;
+  }
+  try {
+    const decoded = Buffer.from(rawValue, 'base64');
+    return decoded.length > 0 && decoded.length <= maximumBytes ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function appAttestClientData(challenge, method, pathname, rawBody = Buffer.alloc(0)) {
+  const bodyHash = createHash('sha256').update(rawBody).digest('hex');
+  return Buffer.from([
+    'my-path-app-attest-v1',
+    challenge,
+    String(method || '').toUpperCase(),
+    pathname,
+    bodyHash,
+  ].join('\n'), 'utf8');
+}
+
+function verifyAppAttestRequest({
+  req,
+  pathname,
+  rawBody,
+  identity,
+  ledger = getPlayerUsageLedger(),
+  at = new Date(),
+  assertionVerifier = verifyAssertion,
+  enforcement = appAttestEnforcement,
+}) {
+  if (!appAttestIsRequired(req, enforcement)) {
+    return { verified: false, legacy: true };
+  }
+  if (identity.isLegacy) {
+    throw new AppAttestRequestError(
+      'app_attest_player_id_required',
+      'This version requires a secure player identity. Restart the app and try again.',
+    );
+  }
+
+  const keyId = String(req.headers['x-my-path-app-attest-key-id'] || '').trim();
+  const rawAssertion = req.headers['x-my-path-app-attest-assertion'];
+  const rawChallengeToken = req.headers['x-my-path-app-attest-challenge-token'];
+  if (!keyId || !rawAssertion || !rawChallengeToken) {
+    throw new AppAttestRequestError(
+      'app_attest_required',
+      'This request could not be verified as coming from the genuine My Path app.',
+    );
+  }
+
+  const challengeState = verifiedAppAttestChallengeToken(
+    rawChallengeToken,
+    identity.hash,
+    'assertion',
+    at,
+  );
+  if (!challengeState) {
+    throw new AppAttestRequestError(
+      'app_attest_challenge_invalid',
+      'The secure request challenge expired. Please try again.',
+    );
+  }
+
+  const keyRecord = ledger.appAttestKey(keyId);
+  if (!keyRecord || keyRecord.playerHash !== identity.hash) {
+    throw new AppAttestRequestError(
+      'app_attest_key_unknown',
+      'This device needs to securely register again. Please try once more.',
+    );
+  }
+  const assertion = decodedBase64Value(rawAssertion, 16_384);
+  if (!assertion) {
+    throw new AppAttestRequestError(
+      'app_attest_assertion_invalid',
+      'The secure request proof was malformed.',
+    );
+  }
+
+  let result;
+  try {
+    result = assertionVerifier({
+      assertion,
+      payload: appAttestClientData(challengeState.c, req.method, pathname, rawBody),
+      publicKey: keyRecord.publicKey,
+      bundleIdentifier: appAttestBundleIdentifier,
+      teamIdentifier: appAttestTeamIdentifier,
+      signCount: keyRecord.signCount,
+    });
+  } catch (error) {
+    console.warn('Rejected App Attest assertion:', error instanceof Error ? error.message : error);
+    throw new AppAttestRequestError(
+      'app_attest_assertion_invalid',
+      'The secure request proof could not be verified.',
+    );
+  }
+
+  ledger.advanceAppAttestSignCount(
+    keyId,
+    keyRecord.signCount,
+    result.signCount,
+    at,
+  );
+  return { verified: true, keyId, signCount: result.signCount };
+}
+
+function sendAppAttestError(res, error) {
+  const statusCode = error instanceof AppAttestRequestError ? error.statusCode : 401;
+  return sendJson(res, statusCode, {
+    error: {
+      code: error instanceof AppAttestRequestError ? error.code : 'app_attest_failed',
+      message: error instanceof Error
+        ? error.message
+        : 'The request could not be verified as coming from the genuine My Path app.',
+    },
+  }, { 'Cache-Control': 'no-store' });
 }
 
 function estimatedChatWalletTokens(body, route, at = new Date()) {
@@ -578,12 +913,16 @@ async function readJsonBody(req) {
     chunks.push(chunk);
   }
 
-  const raw = Buffer.concat(chunks).toString('utf8').trim();
-  if (!raw) {
+  const rawBody = Buffer.concat(chunks);
+  const rawText = rawBody.toString('utf8').trim();
+  if (!rawText) {
     throw new Error('Missing JSON body');
   }
 
-  return JSON.parse(raw);
+  return {
+    body: JSON.parse(rawText),
+    rawBody,
+  };
 }
 
 function validateChatCompletionBody(body) {
@@ -776,18 +1115,159 @@ const server = createServer(async (req, res) => {
         endpoints: [
           '/v1/health/ai',
           '/v1/health/openai',
+          '/v1/app-attest/challenge',
+          '/v1/app-attest/register',
           '/v1/chat/completions',
           '/v1/creator-codes/redeem',
           '/v1/player-safety/account-deleted',
         ],
         models: [...modelRoutes.keys()],
+        app_attest: {
+          enforcement: appAttestEnforcement,
+          required_build: appAttestRequiredBuild,
+        },
       });
     }
 
+    if (req.method === 'POST' && url.pathname === '/v1/app-attest/challenge') {
+      let parsed;
+      try {
+        parsed = await readJsonBody(req);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'app_attest_challenge_request_invalid',
+            message: error instanceof Error ? error.message : 'Invalid JSON body.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+      const identity = playerQuotaIdentity(req);
+      if (identity.isLegacy) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'app_attest_player_id_required',
+            message: 'A secure player identity is required before requesting an App Attest challenge.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+      const purpose = parsed.body?.purpose;
+      if (purpose !== 'attestation' && purpose !== 'assertion') {
+        return sendJson(res, 400, {
+          error: {
+            code: 'app_attest_purpose_invalid',
+            message: 'App Attest challenge purpose must be attestation or assertion.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        purpose,
+        challenges: issueAppAttestChallenges(
+          identity.hash,
+          purpose,
+          parsed.body?.count,
+        ),
+      }, { 'Cache-Control': 'no-store' });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/app-attest/register') {
+      let parsed;
+      try {
+        parsed = await readJsonBody(req);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'app_attest_registration_invalid',
+            message: error instanceof Error ? error.message : 'Invalid JSON body.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+      const identity = playerQuotaIdentity(req);
+      if (identity.isLegacy) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'app_attest_player_id_required',
+            message: 'A secure player identity is required before registering App Attest.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      const keyId = typeof parsed.body?.key_id === 'string'
+        ? parsed.body.key_id.trim()
+        : '';
+      const attestation = decodedBase64Value(parsed.body?.attestation, 128_000);
+      const challengeState = verifiedAppAttestChallengeToken(
+        parsed.body?.challenge_token,
+        identity.hash,
+        'attestation',
+      );
+      if (!keyId
+          || keyId.length > 256
+          || !/^[A-Za-z0-9+/=_-]+$/.test(keyId)
+          || !attestation
+          || !challengeState) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'app_attest_registration_invalid',
+            message: 'The App Attest registration proof was missing, malformed, or expired.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      try {
+        const verified = verifyAttestation({
+          attestation,
+          challenge: Buffer.from(challengeState.c, 'base64url'),
+          keyId,
+          bundleIdentifier: appAttestBundleIdentifier,
+          teamIdentifier: appAttestTeamIdentifier,
+          allowDevelopmentEnvironment: appAttestAllowDevelopmentEnvironment,
+        });
+        const record = getPlayerUsageLedger().registerAppAttestKey({
+          keyId: verified.keyId,
+          playerHash: identity.hash,
+          publicKey: verified.publicKey,
+          environment: verified.environment,
+        });
+        return sendJson(res, 200, {
+          ok: true,
+          registered: true,
+          environment: record.environment,
+        }, { 'Cache-Control': 'no-store' });
+      } catch (error) {
+        console.warn('Rejected App Attest registration:', error instanceof Error ? error.message : error);
+        return sendJson(res, 401, {
+          error: {
+            code: 'app_attest_registration_rejected',
+            message: 'This app installation could not be verified by App Attest.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+    }
+
     if (req.method === 'POST' && url.pathname === '/v1/player-safety/account-deleted') {
+      let parsed;
+      try {
+        parsed = await readJsonBody(req);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: { message: error instanceof Error ? error.message : 'Invalid JSON body.' },
+        }, { 'Cache-Control': 'no-store' });
+      }
       const at = new Date();
       const day = playerQuotaUTCDateKey(at);
       const identity = playerQuotaIdentity(req);
+      try {
+        verifyAppAttestRequest({
+          req,
+          pathname: url.pathname,
+          rawBody: parsed.rawBody,
+          identity,
+          at,
+        });
+      } catch (error) {
+        return sendAppAttestError(res, error);
+      }
       const receiptState = verifiedPlayerQuotaReceipt(
         req.headers['x-my-path-quota-receipt'],
         identity.hash,
@@ -811,13 +1291,28 @@ const server = createServer(async (req, res) => {
       }
 
       let body;
+      let rawBody;
       try {
-        body = await readJsonBody(req);
+        const parsed = await readJsonBody(req);
+        body = parsed.body;
+        rawBody = parsed.rawBody;
       } catch (error) {
         recordCreatorCodeFailure(address);
         return sendJson(res, 400, {
           error: { message: error instanceof Error ? error.message : 'Invalid JSON body.' },
         }, noStoreHeaders);
+      }
+
+      const identity = playerQuotaIdentity(req);
+      try {
+        verifyAppAttestRequest({
+          req,
+          pathname: url.pathname,
+          rawBody,
+          identity,
+        });
+      } catch (error) {
+        return sendAppAttestError(res, error);
       }
 
       let catalog;
@@ -888,8 +1383,11 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/v1/chat/completions') {
       let body;
+      let rawBody;
       try {
-        body = await readJsonBody(req);
+        const parsed = await readJsonBody(req);
+        body = parsed.body;
+        rawBody = parsed.rawBody;
       } catch (error) {
         return sendJson(res, 400, {
           error: {
@@ -908,6 +1406,20 @@ const server = createServer(async (req, res) => {
       }
 
       const route = routeForModel(body.model);
+      const quotaAt = new Date();
+      const quotaDay = playerQuotaUTCDateKey(quotaAt);
+      const quotaIdentity = playerQuotaIdentity(req);
+      try {
+        verifyAppAttestRequest({
+          req,
+          pathname: url.pathname,
+          rawBody,
+          identity: quotaIdentity,
+          at: quotaAt,
+        });
+      } catch (error) {
+        return sendAppAttestError(res, error);
+      }
       if (!route.apiKey) {
         return sendJson(res, 503, {
           error: {
@@ -915,10 +1427,6 @@ const server = createServer(async (req, res) => {
           },
         });
       }
-
-      const quotaAt = new Date();
-      const quotaDay = playerQuotaUTCDateKey(quotaAt);
-      const quotaIdentity = playerQuotaIdentity(req);
       const receiptState = verifiedPlayerQuotaReceipt(
         req.headers['x-my-path-quota-receipt'],
         quotaIdentity.hash,
@@ -998,8 +1506,12 @@ if (isMainModule) {
 }
 
 export {
+  AppAttestRequestError,
   PlayerUsageLedger,
   actualChatWalletTokens,
+  appAttestChallengeToken,
+  appAttestClientData,
+  appAttestIsRequired,
   attachPricingMetadata,
   creatorCodeInteger,
   creatorCodeRequestIsRateLimited,
@@ -1019,6 +1531,9 @@ export {
   resolveCreatorCode,
   routeForModel,
   server,
+  issueAppAttestChallenges,
+  verifiedAppAttestChallengeToken,
   verifiedPlayerQuotaReceipt,
+  verifyAppAttestRequest,
   estimatedChatWalletTokens,
 };

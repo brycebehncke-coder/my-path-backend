@@ -5,8 +5,11 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  AppAttestRequestError,
   PlayerUsageLedger,
   actualChatWalletTokens,
+  appAttestClientData,
+  appAttestIsRequired,
   attachPricingMetadata,
   estimatedChatWalletTokens,
   normalizeCreatorCode,
@@ -15,13 +18,16 @@ import {
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
   forwardedChatBody,
+  issueAppAttestChallenges,
   mergedUsage,
   normalizeModelName,
   normalizePlayerIdentifier,
   playerQuotaHash,
   playerQuotaReceipt,
   routeForModel,
+  verifiedAppAttestChallengeToken,
   verifiedPlayerQuotaReceipt,
+  verifyAppAttestRequest,
 } from './server.mjs';
 
 test('normalizes creator codes without exposing formatting differences', () => {
@@ -292,5 +298,187 @@ test('reserves conservatively but reconciles against actual provider usage', () 
       new Date('2026-08-01T06:30:00Z'),
     ),
     2_000,
+  );
+});
+
+test('App Attest challenges are signed, short lived, and bound to one player and purpose', () => {
+  const at = new Date('2026-08-01T12:00:00Z');
+  const playerHash = playerQuotaHash('attest-player');
+  const challenge = issueAppAttestChallenges(playerHash, 'assertion', 3, at)[0];
+
+  const verified = verifiedAppAttestChallengeToken(
+    challenge.challenge_token,
+    playerHash,
+    'assertion',
+    at,
+  );
+  assert.equal(verified.c, challenge.challenge);
+  assert.equal(verified.u, 'assertion');
+  assert.equal(
+    verifiedAppAttestChallengeToken(
+      challenge.challenge_token,
+      playerQuotaHash('different-player'),
+      'assertion',
+      at,
+    ),
+    null,
+  );
+  assert.equal(
+    verifiedAppAttestChallengeToken(challenge.challenge_token, playerHash, 'attestation', at),
+    null,
+  );
+  assert.equal(
+    verifiedAppAttestChallengeToken(
+      challenge.challenge_token,
+      playerHash,
+      'assertion',
+      new Date(challenge.expires_at_ms + 1),
+    ),
+    null,
+  );
+  assert.equal(
+    verifiedAppAttestChallengeToken(`${challenge.challenge_token}x`, playerHash, 'assertion', at),
+    null,
+  );
+});
+
+test('App Attest request binding changes with the method, path, or exact body bytes', () => {
+  const body = Buffer.from('{"answer":42}');
+  const baseline = appAttestClientData('challenge-value', 'POST', '/v1/example', body);
+  assert.notDeepEqual(
+    baseline,
+    appAttestClientData('challenge-value', 'PUT', '/v1/example', body),
+  );
+  assert.notDeepEqual(
+    baseline,
+    appAttestClientData('challenge-value', 'POST', '/v1/other', body),
+  );
+  assert.notDeepEqual(
+    baseline,
+    appAttestClientData('challenge-value', 'POST', '/v1/example', Buffer.from('{ "answer": 42 }')),
+  );
+});
+
+test('App Attest enforcement supports rollout builds and a strict production switch', () => {
+  const oldRequest = { headers: { 'x-my-path-client-build': '171' } };
+  const newRequest = { headers: { 'x-my-path-client-build': '172' } };
+  assert.equal(appAttestIsRequired(oldRequest, 'new-builds'), false);
+  assert.equal(appAttestIsRequired(newRequest, 'new-builds'), true);
+  assert.equal(appAttestIsRequired(oldRequest, 'required'), true);
+  assert.equal(appAttestIsRequired(newRequest, 'off'), false);
+});
+
+test('persists App Attest public keys and never resets an assertion counter on registration', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'my-path-app-attest-'));
+  const filePath = join(directory, 'usage.json');
+  const keyId = `${'A'.repeat(43)}=`;
+  const playerHash = playerQuotaHash('persisted-attest-player');
+  const publicKey = '-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----';
+  const at = new Date('2026-08-01T12:00:00Z');
+
+  try {
+    const first = new PlayerUsageLedger({ filePath });
+    first.registerAppAttestKey({
+      keyId,
+      playerHash,
+      publicKey,
+      environment: 'production',
+    }, at);
+    first.advanceAppAttestSignCount(keyId, 0, 7, at);
+    first.registerAppAttestKey({
+      keyId,
+      playerHash,
+      publicKey,
+      environment: 'production',
+    }, at);
+    assert.equal(first.appAttestKey(keyId).signCount, 7);
+
+    const reloaded = new PlayerUsageLedger({ filePath });
+    assert.equal(reloaded.appAttestKey(keyId).signCount, 7);
+    assert.equal(reloaded.appAttestKey(keyId).playerHash, playerHash);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('accepts a valid bound assertion once and rejects a replayed counter', () => {
+  const at = new Date('2026-08-01T12:00:00Z');
+  const identifier = '866f9714-c058-4d2d-bf34-93f57086e437';
+  const identity = { identifier, hash: playerQuotaHash(identifier), isLegacy: false };
+  const keyId = `${'B'.repeat(43)}=`;
+  const rawBody = Buffer.from('{"model":"gpt-4o-mini"}');
+  const challenge = issueAppAttestChallenges(identity.hash, 'assertion', 1, at)[0];
+  const ledger = new PlayerUsageLedger();
+  ledger.registerAppAttestKey({
+    keyId,
+    playerHash: identity.hash,
+    publicKey: '-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----',
+    environment: 'production',
+  }, at);
+  const req = {
+    method: 'POST',
+    headers: {
+      'x-my-path-client-build': '172',
+      'x-my-path-app-attest-key-id': keyId,
+      'x-my-path-app-attest-assertion': Buffer.from('signed-proof').toString('base64'),
+      'x-my-path-app-attest-challenge-token': challenge.challenge_token,
+    },
+  };
+  let verifierCalls = 0;
+  const assertionVerifier = (input) => {
+    verifierCalls += 1;
+    assert.deepEqual(
+      input.payload,
+      appAttestClientData(challenge.challenge, 'POST', '/v1/chat/completions', rawBody),
+    );
+    return { signCount: 1 };
+  };
+
+  const result = verifyAppAttestRequest({
+    req,
+    pathname: '/v1/chat/completions',
+    rawBody,
+    identity,
+    ledger,
+    at,
+    assertionVerifier,
+    enforcement: 'new-builds',
+  });
+  assert.deepEqual(result, { verified: true, keyId, signCount: 1 });
+  assert.equal(ledger.appAttestKey(keyId).signCount, 1);
+
+  assert.throws(
+    () => verifyAppAttestRequest({
+      req,
+      pathname: '/v1/chat/completions',
+      rawBody,
+      identity,
+      ledger,
+      at,
+      assertionVerifier,
+      enforcement: 'new-builds',
+    }),
+    /counter did not advance/i,
+  );
+  assert.equal(verifierCalls, 2);
+});
+
+test('new protected builds get a clear App Attest error when proof headers are absent', () => {
+  const req = { method: 'POST', headers: { 'x-my-path-client-build': '172' } };
+  const identity = {
+    identifier: '866f9714-c058-4d2d-bf34-93f57086e437',
+    hash: playerQuotaHash('866f9714-c058-4d2d-bf34-93f57086e437'),
+    isLegacy: false,
+  };
+  assert.throws(
+    () => verifyAppAttestRequest({
+      req,
+      pathname: '/v1/chat/completions',
+      rawBody: Buffer.from('{}'),
+      identity,
+      ledger: new PlayerUsageLedger(),
+      enforcement: 'new-builds',
+    }),
+    (error) => error instanceof AppAttestRequestError && error.code === 'app_attest_required',
   );
 });

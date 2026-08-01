@@ -8,6 +8,9 @@
     "start": "node server.mjs",
     "test": "node --test server.test.mjs"
   },
+  "dependencies": {
+    "node-app-attest": "1.0.1"
+  },
   "engines": {
     "node": ">=20"
   }
