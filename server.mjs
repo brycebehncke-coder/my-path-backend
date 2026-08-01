@@ -4,6 +4,27 @@ import { pathToFileURL } from 'node:url';
 const port = Number(process.env.PORT || 3000);
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
+const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
+const creatorCodeFailureWindowMs = 10 * 60 * 1000;
+const creatorCodeMaximumFailuresPerWindow = 15;
+const creatorCodeFailureWindows = new Map();
+
+const creatorCodeRewardTypes = new Set([
+  'ai_tokens',
+  'cash',
+  'custom_life_access',
+  'dlc',
+  'all_dlcs',
+  'stat',
+]);
+const creatorCodeStatIDs = new Set([
+  'health',
+  'happiness',
+  'intelligence',
+  'charm',
+  'fitness',
+  'reputation',
+]);
 
 const modelRoutes = new Map([
   ['gpt-4o-mini', {
@@ -62,11 +83,197 @@ function attachPricingMetadata(payload, route, at = new Date()) {
   return payload;
 }
 
-function sendJson(res, statusCode, payload) {
+function normalizeCreatorCode(rawCode) {
+  return String(rawCode || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 80);
+}
+
+function creatorCodeSafeText(value, maximumLength) {
+  return typeof value === 'string'
+    ? value.trim().replace(/\s+/g, ' ').slice(0, maximumLength)
+    : '';
+}
+
+function creatorCodeInteger(value, minimum, maximum, fallback = null) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.min(maximum, Math.max(minimum, Math.trunc(number)));
+}
+
+function normalizeCreatorCodeReward(rawReward, codeName, index) {
+  if (!rawReward || typeof rawReward !== 'object' || Array.isArray(rawReward)) {
+    throw new Error(`${codeName} reward ${index + 1} must be an object.`);
+  }
+  const type = creatorCodeSafeText(rawReward.type, 40).toLowerCase();
+  if (!creatorCodeRewardTypes.has(type)) {
+    throw new Error(`${codeName} reward ${index + 1} has unsupported type ${type || '(missing)'}.`);
+  }
+
+  const reward = { type };
+  const label = creatorCodeSafeText(rawReward.label, 100);
+  if (label) {
+    reward.label = label;
+  }
+
+  switch (type) {
+    case 'ai_tokens':
+      reward.amount = creatorCodeInteger(rawReward.amount, 1, 50_000_000);
+      if (!reward.amount) throw new Error(`${codeName} AI token reward needs a positive amount.`);
+      break;
+    case 'cash':
+      reward.amount = creatorCodeInteger(rawReward.amount, 1, 2_000_000_000);
+      if (!reward.amount) throw new Error(`${codeName} cash reward needs a positive amount.`);
+      break;
+    case 'custom_life_access':
+      reward.hours = creatorCodeInteger(rawReward.hours, 1, 8_760);
+      if (!reward.hours) throw new Error(`${codeName} Custom Life reward needs positive hours.`);
+      break;
+    case 'dlc': {
+      const id = creatorCodeSafeText(rawReward.id, 80).toLowerCase();
+      if (!/^[a-z0-9_]+$/.test(id)) throw new Error(`${codeName} DLC reward needs a valid id.`);
+      reward.id = id;
+      break;
+    }
+    case 'stat': {
+      const id = creatorCodeSafeText(rawReward.id, 40).toLowerCase();
+      if (!creatorCodeStatIDs.has(id)) throw new Error(`${codeName} stat reward has unsupported id ${id || '(missing)'}.`);
+      reward.id = id;
+      reward.amount = creatorCodeInteger(rawReward.amount, -100, 100, 0);
+      if (!reward.amount) throw new Error(`${codeName} stat reward needs a non-zero amount.`);
+      break;
+    }
+    case 'all_dlcs':
+      break;
+    default:
+      throw new Error(`${codeName} reward type is unsupported.`);
+  }
+  return reward;
+}
+
+function parseCreatorCodeDate(value, fieldName, codeName) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`${codeName} has an invalid ${fieldName}.`);
+  }
+  return date;
+}
+
+function parseCreatorCodeCatalog(rawJSON = '') {
+  const trimmed = String(rawJSON || '').trim();
+  if (!trimmed) {
+    return new Map();
+  }
+
+  const parsed = JSON.parse(trimmed);
+  const entries = Array.isArray(parsed)
+    ? parsed.map((definition) => [definition?.code, definition])
+    : Object.entries(parsed || {});
+  const catalog = new Map();
+
+  for (const [rawCode, rawDefinition] of entries) {
+    const code = normalizeCreatorCode(rawCode);
+    if (code.length < 6) {
+      throw new Error('Every creator code must contain at least 6 letters or numbers.');
+    }
+    if (!rawDefinition || typeof rawDefinition !== 'object' || Array.isArray(rawDefinition)) {
+      throw new Error(`${code} must contain a reward definition object.`);
+    }
+    if (catalog.has(code)) {
+      throw new Error(`Duplicate creator code after normalization: ${code}.`);
+    }
+
+    const rawRewards = rawDefinition.rewards;
+    if (!Array.isArray(rawRewards) || rawRewards.length === 0 || rawRewards.length > 12) {
+      throw new Error(`${code} must contain between 1 and 12 rewards.`);
+    }
+    const startsAt = parseCreatorCodeDate(rawDefinition.starts_at, 'starts_at', code);
+    const expiresAt = parseCreatorCodeDate(rawDefinition.expires_at, 'expires_at', code);
+    if (startsAt && expiresAt && startsAt >= expiresAt) {
+      throw new Error(`${code} expires_at must be later than starts_at.`);
+    }
+
+    catalog.set(code, {
+      id: creatorCodeSafeText(rawDefinition.id, 100) || code.toLowerCase(),
+      title: creatorCodeSafeText(rawDefinition.title, 80) || 'Creator Reward',
+      message: creatorCodeSafeText(rawDefinition.message, 240),
+      repeatable: rawDefinition.repeatable === true,
+      minimumBuild: creatorCodeInteger(rawDefinition.minimum_build, 1, 1_000_000, 1),
+      startsAt,
+      expiresAt,
+      rewards: rawRewards.map((reward, index) => normalizeCreatorCodeReward(reward, code, index)),
+    });
+  }
+  return catalog;
+}
+
+function resolveCreatorCode(catalog, rawCode, clientBuild = 1, at = new Date()) {
+  const normalizedCode = normalizeCreatorCode(rawCode);
+  const definition = catalog.get(normalizedCode);
+  if (!definition) {
+    return { status: 404, error: 'That code is not valid.' };
+  }
+  if (definition.startsAt && at < definition.startsAt) {
+    return { status: 404, error: 'That code is not active yet.' };
+  }
+  if (definition.expiresAt && at >= definition.expiresAt) {
+    return { status: 410, error: 'That code has expired.' };
+  }
+  if (clientBuild < definition.minimumBuild) {
+    return { status: 409, error: 'Update My Path before using this code.' };
+  }
+  return {
+    status: 200,
+    redemption: {
+      id: definition.id,
+      title: definition.title,
+      message: definition.message,
+      repeatable: definition.repeatable,
+      rewards: definition.rewards,
+    },
+  };
+}
+
+function creatorCodeClientAddress(req) {
+  const forwarded = creatorCodeSafeText(req.headers['x-forwarded-for'], 200).split(',')[0].trim();
+  return forwarded || req.socket.remoteAddress || 'unknown';
+}
+
+function creatorCodeRequestIsRateLimited(address, at = Date.now()) {
+  const existing = creatorCodeFailureWindows.get(address);
+  if (!existing || at - existing.startedAt >= creatorCodeFailureWindowMs) {
+    if (existing) creatorCodeFailureWindows.delete(address);
+    return false;
+  }
+  return existing.failures >= creatorCodeMaximumFailuresPerWindow;
+}
+
+function recordCreatorCodeFailure(address, at = Date.now()) {
+  const existing = creatorCodeFailureWindows.get(address);
+  if (!existing || at - existing.startedAt >= creatorCodeFailureWindowMs) {
+    creatorCodeFailureWindows.set(address, { startedAt: at, failures: 1 });
+  } else {
+    existing.failures += 1;
+  }
+  if (creatorCodeFailureWindows.size > 10_000) {
+    for (const [key, window] of creatorCodeFailureWindows) {
+      if (at - window.startedAt >= creatorCodeFailureWindowMs) creatorCodeFailureWindows.delete(key);
+    }
+  }
+}
+
+function sendJson(res, statusCode, payload, additionalHeaders = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
+    ...additionalHeaders,
   });
   res.end(body);
 }
@@ -286,9 +493,57 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         service: 'AgeUp backend',
-        endpoints: ['/v1/health/ai', '/v1/health/openai', '/v1/chat/completions'],
+        endpoints: ['/v1/health/ai', '/v1/health/openai', '/v1/chat/completions', '/v1/creator-codes/redeem'],
         models: [...modelRoutes.keys()],
       });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/creator-codes/redeem') {
+      const address = creatorCodeClientAddress(req);
+      const noStoreHeaders = { 'Cache-Control': 'no-store' };
+      if (creatorCodeRequestIsRateLimited(address)) {
+        return sendJson(res, 429, {
+          error: { message: 'Too many incorrect code attempts. Try again later.' },
+        }, noStoreHeaders);
+      }
+
+      let body;
+      try {
+        body = await readJsonBody(req);
+      } catch (error) {
+        recordCreatorCodeFailure(address);
+        return sendJson(res, 400, {
+          error: { message: error instanceof Error ? error.message : 'Invalid JSON body.' },
+        }, noStoreHeaders);
+      }
+
+      let catalog;
+      try {
+        catalog = parseCreatorCodeCatalog(creatorCodesJSON);
+      } catch (error) {
+        console.error('Invalid CREATOR_CODES_JSON:', error);
+        return sendJson(res, 503, {
+          error: { message: 'Creator codes are temporarily unavailable.' },
+        }, noStoreHeaders);
+      }
+      if (catalog.size === 0) {
+        return sendJson(res, 503, {
+          error: { message: 'Creator codes are not available yet.' },
+        }, noStoreHeaders);
+      }
+
+      const clientBuild = creatorCodeInteger(body?.client_build, 1, 1_000_000, 1);
+      const result = resolveCreatorCode(catalog, body?.code, clientBuild);
+      if (result.status !== 200) {
+        recordCreatorCodeFailure(address);
+        return sendJson(res, result.status, {
+          error: { message: result.error },
+        }, noStoreHeaders);
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        ...result.redemption,
+      }, noStoreHeaders);
     }
 
     if (req.method === 'GET' && (url.pathname === '/v1/health/ai' || url.pathname === '/v1/health/openai')) {
@@ -397,12 +652,18 @@ if (isMainModule) {
 
 export {
   attachPricingMetadata,
+  creatorCodeInteger,
+  creatorCodeRequestIsRateLimited,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
   forwardedChatBody,
   mergedUsage,
   modelRoutes,
+  normalizeCreatorCode,
   normalizeModelName,
+  parseCreatorCodeCatalog,
+  recordCreatorCodeFailure,
+  resolveCreatorCode,
   routeForModel,
   server,
 };

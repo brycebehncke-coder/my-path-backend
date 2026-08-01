@@ -3,6 +3,9 @@ import test from 'node:test';
 
 import {
   attachPricingMetadata,
+  normalizeCreatorCode,
+  parseCreatorCodeCatalog,
+  resolveCreatorCode,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
   forwardedChatBody,
@@ -10,6 +13,59 @@ import {
   normalizeModelName,
   routeForModel,
 } from './server.mjs';
+
+test('normalizes creator codes without exposing formatting differences', () => {
+  assert.equal(normalizeCreatorCode(' bryce-launch 2026 '), 'BRYCELAUNCH2026');
+  assert.equal(normalizeCreatorCode('Bryce_Launch-2026'), 'BRYCELAUNCH2026');
+});
+
+test('parses flexible creator rewards and resolves only the matching code', () => {
+  const catalog = parseCreatorCodeCatalog(JSON.stringify({
+    'BRYCE-LAUNCH-2026': {
+      id: 'launch-2026',
+      title: 'Launch Gift',
+      message: 'Thanks for playing.',
+      minimum_build: 168,
+      expires_at: '2027-01-01T00:00:00Z',
+      rewards: [
+        { type: 'ai_tokens', amount: 200_000 },
+        { type: 'custom_life_access', hours: 24 },
+        { type: 'dlc', id: 'walker_apocalypse' },
+        { type: 'stat', id: 'happiness', amount: 10 },
+      ],
+    },
+  }));
+
+  assert.equal(catalog.size, 1);
+  const valid = resolveCreatorCode(
+    catalog,
+    'bryce launch 2026',
+    168,
+    new Date('2026-08-01T12:00:00Z'),
+  );
+  assert.equal(valid.status, 200);
+  assert.equal(valid.redemption.id, 'launch-2026');
+  assert.equal(valid.redemption.rewards[0].amount, 200_000);
+  assert.equal(valid.redemption.rewards[2].id, 'walker_apocalypse');
+
+  assert.equal(resolveCreatorCode(catalog, 'not-real', 168).status, 404);
+  assert.equal(resolveCreatorCode(catalog, 'BRYCE-LAUNCH-2026', 167).status, 409);
+  assert.equal(
+    resolveCreatorCode(catalog, 'BRYCE-LAUNCH-2026', 168, new Date('2027-01-01T00:00:00Z')).status,
+    410,
+  );
+});
+
+test('rejects malformed creator reward definitions instead of granting partial rewards', () => {
+  assert.throws(
+    () => parseCreatorCodeCatalog(JSON.stringify({
+      'BROKEN-CODE': {
+        rewards: [{ type: 'stat', id: 'made_up_stat', amount: 100 }],
+      },
+    })),
+    /unsupported id/,
+  );
+});
 
 test('marks only the announced DeepSeek UTC windows as double-price periods', () => {
   assert.equal(deepSeekPricingMultiplier(new Date('2026-07-21T00:59:59Z')), 1);
