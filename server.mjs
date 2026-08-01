@@ -1,4 +1,7 @@
 import { createServer } from 'node:http';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const port = Number(process.env.PORT || 3000);
@@ -8,6 +11,19 @@ const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
 const creatorCodeFailureWindowMs = 10 * 60 * 1000;
 const creatorCodeMaximumFailuresPerWindow = 15;
 const creatorCodeFailureWindows = new Map();
+const playerDailyAITokenLimit = configuredPositiveInteger(
+  process.env.PLAYER_DAILY_AI_TOKEN_LIMIT,
+  500_000,
+  10_000,
+  100_000_000,
+);
+const playerUsageLedgerPath = (process.env.PLAYER_USAGE_LEDGER_PATH || '').trim()
+  || '/tmp/my-path-player-usage-v1.json';
+const playerQuotaSigningSecret = (process.env.PLAYER_QUOTA_SIGNING_SECRET || '').trim()
+  || createHash('sha256')
+    .update(`my-path-quota-v1\0${openaiApiKey}\0${deepSeekApiKey}`)
+    .digest('hex');
+let sharedPlayerUsageLedger;
 
 const creatorCodeRewardTypes = new Set([
   'ai_tokens',
@@ -81,6 +97,270 @@ function attachPricingMetadata(payload, route, at = new Date()) {
     pricing_period: multiplier === 2 ? 'peak' : 'regular',
   };
   return payload;
+}
+
+function configuredPositiveInteger(value, fallback, minimum, maximum) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(maximum, Math.max(minimum, Math.trunc(parsed)));
+}
+
+function playerQuotaUTCDateKey(at = new Date()) {
+  return at.toISOString().slice(0, 10);
+}
+
+function playerQuotaResetDate(at = new Date()) {
+  const reset = new Date(at);
+  reset.setUTCHours(24, 0, 0, 0);
+  return reset;
+}
+
+function normalizePlayerIdentifier(rawIdentifier) {
+  const identifier = typeof rawIdentifier === 'string'
+    ? rawIdentifier.trim().toLowerCase()
+    : '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(identifier)
+    ? identifier
+    : '';
+}
+
+function playerQuotaHash(identifier) {
+  return createHash('sha256')
+    .update(`my-path-player-v1\0${identifier}`)
+    .digest('hex');
+}
+
+function playerQuotaReceipt(payload, secret = playerQuotaSigningSecret) {
+  const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const signature = createHmac('sha256', secret).update(encoded).digest('base64url');
+  return `${encoded}.${signature}`;
+}
+
+function verifiedPlayerQuotaReceipt(rawReceipt, expectedPlayerHash, expectedDay, secret = playerQuotaSigningSecret) {
+  if (typeof rawReceipt !== 'string' || rawReceipt.length > 4_096) return null;
+  const parts = rawReceipt.trim().split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  const expectedSignature = createHmac('sha256', secret).update(parts[0]).digest('base64url');
+  const providedBuffer = Buffer.from(parts[1]);
+  const expectedBuffer = Buffer.from(expectedSignature);
+  if (providedBuffer.length !== expectedBuffer.length
+      || !timingSafeEqual(providedBuffer, expectedBuffer)) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const used = Number(payload?.u);
+    if (payload?.v !== 1
+        || payload?.p !== expectedPlayerHash
+        || payload?.d !== expectedDay
+        || !Number.isSafeInteger(used)
+        || used < 0) {
+      return null;
+    }
+    return {
+      used,
+      deletedAt: typeof payload.x === 'string' ? payload.x : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+class PlayerUsageLedger {
+  constructor({ filePath = null, dailyLimit = playerDailyAITokenLimit } = {}) {
+    this.filePath = filePath;
+    this.dailyLimit = dailyLimit;
+    this.players = new Map();
+    this.reservations = new Map();
+    this.load();
+  }
+
+  load() {
+    if (!this.filePath || !existsSync(this.filePath)) return;
+    const parsed = JSON.parse(readFileSync(this.filePath, 'utf8'));
+    if (parsed?.version !== 1 || !parsed.players || typeof parsed.players !== 'object') {
+      throw new Error('Player usage ledger has an unsupported format.');
+    }
+    for (const [hash, rawRecord] of Object.entries(parsed.players)) {
+      if (!/^[0-9a-f]{64}$/.test(hash) || !rawRecord || typeof rawRecord !== 'object') continue;
+      const days = {};
+      for (const [day, rawUsed] of Object.entries(rawRecord.days || {})) {
+        const used = Number(rawUsed);
+        if (/^\d{4}-\d{2}-\d{2}$/.test(day) && Number.isSafeInteger(used) && used >= 0) {
+          days[day] = used;
+        }
+      }
+      this.players.set(hash, {
+        createdAt: typeof rawRecord.createdAt === 'string' ? rawRecord.createdAt : new Date(0).toISOString(),
+        lastSeenAt: typeof rawRecord.lastSeenAt === 'string' ? rawRecord.lastSeenAt : new Date(0).toISOString(),
+        deletedAt: typeof rawRecord.deletedAt === 'string' ? rawRecord.deletedAt : null,
+        days,
+      });
+    }
+  }
+
+  persist() {
+    if (!this.filePath) return;
+    mkdirSync(dirname(this.filePath), { recursive: true });
+    const players = Object.fromEntries(this.players);
+    const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
+    writeFileSync(temporaryPath, JSON.stringify({ version: 1, players }), { mode: 0o600 });
+    renameSync(temporaryPath, this.filePath);
+  }
+
+  ensurePlayer(playerHash, at = new Date()) {
+    let record = this.players.get(playerHash);
+    if (!record) {
+      record = {
+        createdAt: at.toISOString(),
+        lastSeenAt: at.toISOString(),
+        deletedAt: null,
+        days: {},
+      };
+      this.players.set(playerHash, record);
+    }
+    record.lastSeenAt = at.toISOString();
+    this.pruneOldDays(record, at);
+    return record;
+  }
+
+  pruneOldDays(record, at = new Date()) {
+    const cutoff = at.getTime() - (8 * 24 * 60 * 60 * 1000);
+    for (const day of Object.keys(record.days)) {
+      const timestamp = Date.parse(`${day}T00:00:00Z`);
+      if (Number.isFinite(timestamp) && timestamp < cutoff) delete record.days[day];
+    }
+  }
+
+  mergeReceiptUsage(playerHash, day, receiptState, at = new Date()) {
+    const record = this.ensurePlayer(playerHash, at);
+    const receiptUsed = Math.max(0, Number(receiptState?.used) || 0);
+    record.days[day] = Math.max(Number(record.days[day]) || 0, receiptUsed);
+    if (receiptState?.deletedAt && !record.deletedAt) record.deletedAt = receiptState.deletedAt;
+    return record;
+  }
+
+  snapshot(playerHash, day, at = new Date()) {
+    const record = this.ensurePlayer(playerHash, at);
+    const used = Math.max(0, Number(record.days[day]) || 0);
+    const reservationKey = `${playerHash}:${day}`;
+    const reserved = Math.max(0, this.reservations.get(reservationKey) || 0);
+    return {
+      used,
+      reserved,
+      remaining: Math.max(0, this.dailyLimit - used - reserved),
+      limit: this.dailyLimit,
+      deletedAt: record.deletedAt,
+    };
+  }
+
+  reserve(playerHash, day, requestedTokens, receiptState = null, at = new Date()) {
+    this.mergeReceiptUsage(playerHash, day, receiptState, at);
+    const requested = Math.max(1, Math.trunc(Number(requestedTokens) || 1));
+    const before = this.snapshot(playerHash, day, at);
+    if (requested > before.remaining) {
+      this.persist();
+      return { allowed: false, snapshot: before };
+    }
+    const reservationKey = `${playerHash}:${day}`;
+    this.reservations.set(reservationKey, before.reserved + requested);
+    this.persist();
+    return {
+      allowed: true,
+      reservation: { playerHash, day, requested, reservationKey },
+      snapshot: this.snapshot(playerHash, day, at),
+    };
+  }
+
+  reconcile(reservation, actualTokens, at = new Date()) {
+    const existingReserved = Math.max(0, this.reservations.get(reservation.reservationKey) || 0);
+    const nextReserved = Math.max(0, existingReserved - reservation.requested);
+    if (nextReserved > 0) this.reservations.set(reservation.reservationKey, nextReserved);
+    else this.reservations.delete(reservation.reservationKey);
+
+    const record = this.ensurePlayer(reservation.playerHash, at);
+    const actual = Math.max(0, Math.trunc(Number(actualTokens) || 0));
+    record.days[reservation.day] = Math.max(0, Number(record.days[reservation.day]) || 0) + actual;
+    this.persist();
+    return this.snapshot(reservation.playerHash, reservation.day, at);
+  }
+
+  release(reservation, at = new Date()) {
+    return this.reconcile(reservation, 0, at);
+  }
+
+  markDeleted(playerHash, day, receiptState = null, at = new Date()) {
+    const record = this.mergeReceiptUsage(playerHash, day, receiptState, at);
+    record.deletedAt = record.deletedAt || at.toISOString();
+    this.persist();
+    return this.snapshot(playerHash, day, at);
+  }
+}
+
+function getPlayerUsageLedger() {
+  if (!sharedPlayerUsageLedger) {
+    sharedPlayerUsageLedger = new PlayerUsageLedger({
+      filePath: playerUsageLedgerPath,
+      dailyLimit: playerDailyAITokenLimit,
+    });
+  }
+  return sharedPlayerUsageLedger;
+}
+
+function playerQuotaIdentity(req) {
+  const supplied = normalizePlayerIdentifier(req.headers['x-my-path-player-id']);
+  const stableIdentifier = supplied || `legacy-ip:${creatorCodeClientAddress(req)}`;
+  return {
+    hash: playerQuotaHash(stableIdentifier),
+    isLegacy: !supplied,
+  };
+}
+
+function estimatedChatWalletTokens(body, route, at = new Date()) {
+  const serializedMessages = JSON.stringify(body?.messages || []);
+  // One token cannot encode more source bytes than are present. Reserving by
+  // UTF-8 byte length keeps a single request from crossing the daily ceiling,
+  // while reconciliation still charges only the provider's reported usage.
+  const promptEstimate = Math.max(1, Buffer.byteLength(serializedMessages, 'utf8'));
+  const requestedCompletion = configuredPositiveInteger(
+    body?.max_completion_tokens ?? body?.max_tokens,
+    1_000,
+    1,
+    100_000,
+  );
+  const possibleAttempts = route.kind === 'deepseek' ? 2 : 1;
+  const pricingMultiplier = route.kind === 'deepseek' ? deepSeekPricingMultiplier(at) : 1;
+  return (promptEstimate + requestedCompletion) * possibleAttempts * pricingMultiplier;
+}
+
+function actualChatWalletTokens(payload, route = null, at = new Date()) {
+  const usage = payload?.usage;
+  const prompt = Math.max(0, Number(usage?.prompt_tokens) || 0);
+  const completion = Math.max(0, Number(usage?.completion_tokens) || 0);
+  const total = Math.max(0, Number(usage?.total_tokens) || (prompt + completion));
+  const reportedMultiplier = configuredPositiveInteger(usage?.wallet_token_multiplier, 1, 1, 2);
+  const routeMultiplier = route?.kind === 'deepseek' ? deepSeekPricingMultiplier(at) : 1;
+  const multiplier = Math.max(reportedMultiplier, routeMultiplier);
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(total) * multiplier);
+}
+
+function quotaHeaders(playerHash, day, snapshot, at = new Date()) {
+  const receipt = playerQuotaReceipt({
+    v: 1,
+    p: playerHash,
+    d: day,
+    u: snapshot.used,
+    x: snapshot.deletedAt,
+  });
+  return {
+    'Cache-Control': 'no-store',
+    'X-My-Path-Daily-Token-Limit': String(snapshot.limit),
+    'X-My-Path-Daily-Tokens-Used': String(snapshot.used),
+    'X-My-Path-Daily-Tokens-Remaining': String(snapshot.remaining),
+    'X-My-Path-Quota-Reset': playerQuotaResetDate(at).toISOString(),
+    'X-My-Path-Quota-Receipt': receipt,
+  };
 }
 
 function normalizeCreatorCode(rawCode) {
@@ -458,7 +738,7 @@ async function proxyChatCompletion(body, route) {
     messages: appendSystemInstruction(forwarded.messages, retryInstruction),
   };
   const second = await performChatCompletion(retryBody, route);
-  if (second.ok && second.payload && typeof second.payload === 'object') {
+  if (second.payload && typeof second.payload === 'object') {
     second.payload.usage = mergedUsage(first.payload?.usage, second.payload.usage);
   }
   return second;
@@ -493,9 +773,32 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         service: 'AgeUp backend',
-        endpoints: ['/v1/health/ai', '/v1/health/openai', '/v1/chat/completions', '/v1/creator-codes/redeem'],
+        endpoints: [
+          '/v1/health/ai',
+          '/v1/health/openai',
+          '/v1/chat/completions',
+          '/v1/creator-codes/redeem',
+          '/v1/player-safety/account-deleted',
+        ],
         models: [...modelRoutes.keys()],
       });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/player-safety/account-deleted') {
+      const at = new Date();
+      const day = playerQuotaUTCDateKey(at);
+      const identity = playerQuotaIdentity(req);
+      const receiptState = verifiedPlayerQuotaReceipt(
+        req.headers['x-my-path-quota-receipt'],
+        identity.hash,
+        day,
+      );
+      const snapshot = getPlayerUsageLedger().markDeleted(identity.hash, day, receiptState, at);
+      return sendJson(res, 200, {
+        ok: true,
+        retained_safety_record: true,
+        message: 'Account data can be deleted without resetting the daily AI safety limit.',
+      }, quotaHeaders(identity.hash, day, snapshot, at));
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/creator-codes/redeem') {
@@ -613,11 +916,55 @@ const server = createServer(async (req, res) => {
         });
       }
 
-      const result = await proxyChatCompletion(body, route);
-      if (result.ok) {
-        attachPricingMetadata(result.payload, route);
+      const quotaAt = new Date();
+      const quotaDay = playerQuotaUTCDateKey(quotaAt);
+      const quotaIdentity = playerQuotaIdentity(req);
+      const receiptState = verifiedPlayerQuotaReceipt(
+        req.headers['x-my-path-quota-receipt'],
+        quotaIdentity.hash,
+        quotaDay,
+      );
+      const estimatedTokens = estimatedChatWalletTokens(body, route, quotaAt);
+      const ledger = getPlayerUsageLedger();
+      const quotaReservation = ledger.reserve(
+        quotaIdentity.hash,
+        quotaDay,
+        estimatedTokens,
+        receiptState,
+        quotaAt,
+      );
+      if (!quotaReservation.allowed) {
+        return sendJson(res, 429, {
+          error: {
+            code: 'daily_ai_token_limit',
+            message: `Daily AI limit reached. Each player can use up to ${playerDailyAITokenLimit.toLocaleString('en-US')} AI Tokens per UTC day. Try again after ${playerQuotaResetDate(quotaAt).toISOString()}.`,
+          },
+        }, quotaHeaders(quotaIdentity.hash, quotaDay, quotaReservation.snapshot, quotaAt));
       }
-      return sendJson(res, result.status, result.payload);
+
+      let result;
+      try {
+        result = await proxyChatCompletion(body, route);
+      } catch (error) {
+        ledger.release(quotaReservation.reservation, new Date());
+        throw error;
+      }
+
+      if (result.payload?.usage) {
+        attachPricingMetadata(result.payload, route, quotaAt);
+      }
+      const actualTokens = actualChatWalletTokens(result.payload, route, quotaAt);
+      const quotaSnapshot = ledger.reconcile(
+        quotaReservation.reservation,
+        actualTokens,
+        new Date(),
+      );
+      return sendJson(
+        res,
+        result.status,
+        result.payload,
+        quotaHeaders(quotaIdentity.hash, quotaDay, quotaSnapshot, quotaAt),
+      );
     }
 
     return sendJson(res, 404, {
@@ -651,6 +998,8 @@ if (isMainModule) {
 }
 
 export {
+  PlayerUsageLedger,
+  actualChatWalletTokens,
   attachPricingMetadata,
   creatorCodeInteger,
   creatorCodeRequestIsRateLimited,
@@ -659,11 +1008,17 @@ export {
   forwardedChatBody,
   mergedUsage,
   modelRoutes,
+  normalizePlayerIdentifier,
   normalizeCreatorCode,
   normalizeModelName,
   parseCreatorCodeCatalog,
+  playerQuotaHash,
+  playerQuotaReceipt,
+  playerQuotaUTCDateKey,
   recordCreatorCodeFailure,
   resolveCreatorCode,
   routeForModel,
   server,
+  verifiedPlayerQuotaReceipt,
+  estimatedChatWalletTokens,
 };

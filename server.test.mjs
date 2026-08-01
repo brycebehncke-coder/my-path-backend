@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  PlayerUsageLedger,
+  actualChatWalletTokens,
   attachPricingMetadata,
+  estimatedChatWalletTokens,
   normalizeCreatorCode,
   parseCreatorCodeCatalog,
   resolveCreatorCode,
@@ -11,7 +17,11 @@ import {
   forwardedChatBody,
   mergedUsage,
   normalizeModelName,
+  normalizePlayerIdentifier,
+  playerQuotaHash,
+  playerQuotaReceipt,
   routeForModel,
+  verifiedPlayerQuotaReceipt,
 } from './server.mjs';
 
 test('normalizes creator codes without exposing formatting differences', () => {
@@ -173,5 +183,114 @@ test('retries only empty or malformed DeepSeek JSON and combines usage', () => {
       { prompt_tokens: 120, completion_tokens: 20, total_tokens: 140 },
     ),
     { prompt_tokens: 220, completion_tokens: 30, total_tokens: 250 },
+  );
+});
+
+test('accepts only canonical player UUIDs and signs receipts for that player and UTC day', () => {
+  const identifier = '866f9714-c058-4d2d-bf34-93f57086e437';
+  const hash = playerQuotaHash(identifier);
+  const secret = 'test-only-quota-secret';
+  const receipt = playerQuotaReceipt({
+    v: 1,
+    p: hash,
+    d: '2026-08-01',
+    u: 12_345,
+    x: null,
+  }, secret);
+
+  assert.equal(normalizePlayerIdentifier(identifier.toUpperCase()), identifier);
+  assert.equal(normalizePlayerIdentifier('not-a-player-id'), '');
+  assert.deepEqual(
+    verifiedPlayerQuotaReceipt(receipt, hash, '2026-08-01', secret),
+    { used: 12_345, deletedAt: null },
+  );
+  assert.equal(verifiedPlayerQuotaReceipt(`${receipt}x`, hash, '2026-08-01', secret), null);
+  assert.equal(verifiedPlayerQuotaReceipt(receipt, playerQuotaHash('other'), '2026-08-01', secret), null);
+  assert.equal(verifiedPlayerQuotaReceipt(receipt, hash, '2026-08-02', secret), null);
+});
+
+test('enforces exactly 500,000 charged AI Tokens per player per UTC day', () => {
+  const ledger = new PlayerUsageLedger({ dailyLimit: 500_000 });
+  const playerHash = playerQuotaHash('quota-test-player');
+  const day = '2026-08-01';
+  const at = new Date('2026-08-01T12:00:00Z');
+
+  const first = ledger.reserve(playerHash, day, 300_000, null, at);
+  assert.equal(first.allowed, true);
+  assert.equal(ledger.reconcile(first.reservation, 300_000, at).used, 300_000);
+
+  const second = ledger.reserve(playerHash, day, 200_000, null, at);
+  assert.equal(second.allowed, true);
+  const full = ledger.reconcile(second.reservation, 200_000, at);
+  assert.equal(full.used, 500_000);
+  assert.equal(full.remaining, 0);
+
+  const denied = ledger.reserve(playerHash, day, 1, null, at);
+  assert.equal(denied.allowed, false);
+  assert.equal(denied.snapshot.used, 500_000);
+});
+
+test('never lets an older signed receipt lower known daily usage', () => {
+  const ledger = new PlayerUsageLedger({ dailyLimit: 500_000 });
+  const playerHash = playerQuotaHash('receipt-merge-player');
+  const day = '2026-08-01';
+  const at = new Date('2026-08-01T12:00:00Z');
+  const reservation = ledger.reserve(playerHash, day, 250_000, null, at);
+  ledger.reconcile(reservation.reservation, 250_000, at);
+
+  const snapshot = ledger.reserve(
+    playerHash,
+    day,
+    1,
+    { used: 100_000, deletedAt: null },
+    at,
+  );
+  assert.equal(snapshot.allowed, true);
+  assert.equal(ledger.release(snapshot.reservation, at).used, 250_000);
+});
+
+test('persists the deleted-account tombstone without storing a raw player id', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'my-path-player-quota-'));
+  const filePath = join(directory, 'usage.json');
+  const playerHash = playerQuotaHash('deleted-player');
+  const day = '2026-08-01';
+  const at = new Date('2026-08-01T12:00:00Z');
+
+  try {
+    const first = new PlayerUsageLedger({ filePath, dailyLimit: 500_000 });
+    const deleted = first.markDeleted(playerHash, day, { used: 42_000 }, at);
+    assert.equal(deleted.used, 42_000);
+    assert.equal(deleted.deletedAt, at.toISOString());
+
+    const reloaded = new PlayerUsageLedger({ filePath, dailyLimit: 500_000 });
+    const snapshot = reloaded.snapshot(playerHash, day, at);
+    assert.equal(snapshot.used, 42_000);
+    assert.equal(snapshot.deletedAt, at.toISOString());
+    assert.equal(readFileSync(filePath, 'utf8').includes('deleted-player'), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('reserves conservatively but reconciles against actual provider usage', () => {
+  const body = {
+    model: 'gpt-4o-mini',
+    messages: [{ role: 'user', content: 'Tell one short story.' }],
+    max_tokens: 750,
+  };
+  const serializedBytes = Buffer.byteLength(JSON.stringify(body.messages), 'utf8');
+  assert.equal(
+    estimatedChatWalletTokens(body, routeForModel('gpt-4o-mini')),
+    serializedBytes + 750,
+  );
+
+  const deepSeekUsage = { usage: { prompt_tokens: 800, completion_tokens: 200 } };
+  assert.equal(
+    actualChatWalletTokens(
+      deepSeekUsage,
+      routeForModel('deepseek-v4-pro'),
+      new Date('2026-08-01T06:30:00Z'),
+    ),
+    2_000,
   );
 });
