@@ -28,8 +28,8 @@ App Attest rollout variables:
 APP_ATTEST_TEAM_ID=A8S98U9VW6
 APP_ATTEST_BUNDLE_ID=com.brycebehncke.ageup
 APP_ATTEST_REQUIRED_BUILD=172
-APP_ATTEST_ENFORCEMENT=new-builds
+APP_ATTEST_ENFORCEMENT=required
 APP_ATTEST_ALLOW_DEVELOPMENT=false
 ```
 
-Use `new-builds` while build 172 is processing so earlier TestFlight builds keep working. After build 172 is available to testers, change `APP_ATTEST_ENFORCEMENT` to `required` to prevent clients from bypassing verification by claiming an older build number.
+Build 172 is available to testers, so production should use `required`. The `new-builds` option remains available only for a future staged rollout; it intentionally lets older clients through and must not be left enabled as the final security setting.

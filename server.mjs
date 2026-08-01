@@ -150,7 +150,7 @@ function normalizedAppAttestEnforcement(value) {
   const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
   return ['off', 'new-builds', 'required'].includes(normalized)
     ? normalized
-    : 'new-builds';
+    : 'required';
 }
 
 function playerQuotaUTCDateKey(at = new Date()) {
