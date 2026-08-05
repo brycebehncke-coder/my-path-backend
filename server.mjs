@@ -9,8 +9,10 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { verifyAssertion, verifyAttestation } from 'node-app-attest';
+import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
+const backendRevision = 'deepseek-age-v1';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -57,6 +59,39 @@ const appAttestChallengeSigningSecret = (process.env.APP_ATTEST_CHALLENGE_SECRET
     .update('my-path-app-attest-challenge-v1')
     .digest('hex');
 let sharedPlayerUsageLedger;
+const playIntegrityPackageName = (process.env.PLAY_INTEGRITY_PACKAGE_NAME || '').trim()
+  || 'com.brycebehncke.ageup';
+const playIntegrityEnforcement = normalizedPlayIntegrityEnforcement(
+  process.env.PLAY_INTEGRITY_ENFORCEMENT,
+);
+const playIntegrityTokenTTLMilliseconds = configuredPositiveInteger(
+  process.env.PLAY_INTEGRITY_TOKEN_TTL_MS,
+  2 * 60 * 1000,
+  30_000,
+  10 * 60 * 1000,
+);
+const playIntegrityFutureToleranceMilliseconds = configuredPositiveInteger(
+  process.env.PLAY_INTEGRITY_FUTURE_TOLERANCE_MS,
+  30_000,
+  1_000,
+  2 * 60 * 1000,
+);
+const playIntegrityCertificateDigests = new Set(
+  String(process.env.PLAY_INTEGRITY_CERTIFICATE_SHA256_DIGESTS || '')
+    .split(',')
+    .map(normalizedCertificateDigest)
+    .filter(Boolean),
+);
+let sharedPlayIntegrityGoogleAuth;
+const aiContentReportMaximumPerPlayerPerDay = configuredPositiveInteger(
+  process.env.AI_CONTENT_REPORT_MAX_PER_PLAYER_PER_DAY,
+  20,
+  1,
+  100,
+);
+const aiContentReportCountsByPlayerDay = new Map();
+const aiContentReportAggregateCounts = new Map();
+const aiContentReportCategories = new Set(['offensive_or_inappropriate']);
 
 const creatorCodeRewardTypes = new Set([
   'ai_tokens',
@@ -153,6 +188,13 @@ function normalizedAppAttestEnforcement(value) {
     : 'required';
 }
 
+function normalizedPlayIntegrityEnforcement(value) {
+  const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return ['off', 'required'].includes(normalized)
+    ? normalized
+    : 'required';
+}
+
 function playerQuotaUTCDateKey(at = new Date()) {
   return at.toISOString().slice(0, 10);
 }
@@ -176,6 +218,57 @@ function playerQuotaHash(identifier) {
   return createHash('sha256')
     .update(`my-path-player-v1\0${identifier}`)
     .digest('hex');
+}
+
+function normalizeAIContentReport(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new Error('The content report must be a JSON object.');
+  }
+  const forbiddenFields = ['content', 'content_sha256', 'content_length', 'event_id', 'language'];
+  if (forbiddenFields.some((field) => Object.hasOwn(body, field))) {
+    throw new Error('Content reports must not include story text or identifying story details.');
+  }
+
+  const source = typeof body.source === 'string' ? body.source.trim() : '';
+  const model = normalizeModelName(body.model);
+  const category = typeof body.category === 'string' ? body.category.trim() : '';
+  if (!/^[a-z][a-z0-9_]{0,79}$/.test(source)
+      || !modelRoutes.has(model)
+      || !aiContentReportCategories.has(category)) {
+    throw new Error('The content-report category is invalid.');
+  }
+  return { source, model, category };
+}
+
+function claimAIContentReportSlot(playerHash, at = new Date()) {
+  const day = playerQuotaUTCDateKey(at);
+  const key = `${day}:${playerHash}`;
+  const used = aiContentReportCountsByPlayerDay.get(key) || 0;
+  if (used >= aiContentReportMaximumPerPlayerPerDay) return false;
+  aiContentReportCountsByPlayerDay.set(key, used + 1);
+  if (aiContentReportCountsByPlayerDay.size > 10_000) {
+    for (const candidate of aiContentReportCountsByPlayerDay.keys()) {
+      if (!candidate.startsWith(`${day}:`)) aiContentReportCountsByPlayerDay.delete(candidate);
+    }
+  }
+  return true;
+}
+
+function recordAIContentReport(report, at = new Date()) {
+  const day = playerQuotaUTCDateKey(at);
+  const key = `${day}:${report.source}:${report.model}:${report.category}`;
+  const aggregateCount = (aiContentReportAggregateCounts.get(key) || 0) + 1;
+  aiContentReportAggregateCounts.set(key, aggregateCount);
+  if (aiContentReportAggregateCounts.size > 1_000) {
+    for (const candidate of aiContentReportAggregateCounts.keys()) {
+      if (!candidate.startsWith(`${day}:`)) aiContentReportAggregateCounts.delete(candidate);
+    }
+  }
+  return {
+    report_id: randomBytes(12).toString('hex'),
+    day,
+    aggregate_count: aggregateCount,
+  };
 }
 
 function playerQuotaReceipt(payload, secret = playerQuotaSigningSecret) {
@@ -451,6 +544,15 @@ class AppAttestRequestError extends Error {
   }
 }
 
+class PlayIntegrityRequestError extends Error {
+  constructor(code, message, statusCode = 401) {
+    super(message);
+    this.name = 'PlayIntegrityRequestError';
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
 function appAttestIsRequired(req, enforcement = appAttestEnforcement) {
   if (enforcement === 'off') return false;
   if (enforcement === 'required') return true;
@@ -640,6 +742,243 @@ function verifyAppAttestRequest({
   return { verified: true, keyId, signCount: result.signCount };
 }
 
+function normalizedCertificateDigest(value) {
+  return String(value || '')
+    .trim()
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replace(/=+$/g, '');
+}
+
+function playIntegrityRequestHash(method, pathname, rawBody = Buffer.alloc(0)) {
+  return createHash('sha256')
+    .update([
+      'my-path-play-integrity-v1',
+      String(method || '').toUpperCase(),
+      pathname,
+      rawBody.toString('base64'),
+    ].join('\n'), 'utf8')
+    .digest('base64url');
+}
+
+function constantTimeTextEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left || ''), 'utf8');
+  const rightBuffer = Buffer.from(String(right || ''), 'utf8');
+  return leftBuffer.length === rightBuffer.length
+    && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requestHeader(req, name) {
+  const rawValue = req.headers[name];
+  if (Array.isArray(rawValue)) return String(rawValue[0] || '').trim();
+  return String(rawValue || '').trim();
+}
+
+function getPlayIntegrityGoogleAuth() {
+  if (sharedPlayIntegrityGoogleAuth) return sharedPlayIntegrityGoogleAuth;
+  const rawCredentials = String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+  let credentials;
+  if (rawCredentials) {
+    try {
+      credentials = JSON.parse(rawCredentials);
+    } catch {
+      throw new PlayIntegrityRequestError(
+        'play_integrity_server_misconfigured',
+        'Android verification is temporarily unavailable.',
+        503,
+      );
+    }
+  }
+  sharedPlayIntegrityGoogleAuth = new GoogleAuth({
+    scopes: ['https://www.googleapis.com/auth/playintegrity'],
+    ...(credentials ? { credentials } : {}),
+  });
+  return sharedPlayIntegrityGoogleAuth;
+}
+
+async function decodePlayIntegrityToken({
+  token,
+  packageName = playIntegrityPackageName,
+  auth = getPlayIntegrityGoogleAuth(),
+}) {
+  const client = await auth.getClient();
+  const response = await client.request({
+    url: `https://playintegrity.googleapis.com/v1/${encodeURIComponent(packageName)}:decodeIntegrityToken`,
+    method: 'POST',
+    data: { integrity_token: token },
+  });
+  return response.data?.tokenPayloadExternal;
+}
+
+function validatePlayIntegrityVerdict({
+  verdict,
+  expectedRequestHash,
+  expectedPackageName = playIntegrityPackageName,
+  at = new Date(),
+  tokenTTLMilliseconds = playIntegrityTokenTTLMilliseconds,
+  futureToleranceMilliseconds = playIntegrityFutureToleranceMilliseconds,
+  acceptedCertificateDigests = playIntegrityCertificateDigests,
+}) {
+  const requestDetails = verdict?.requestDetails;
+  const requestTimestamp = Number(requestDetails?.timestampMillis);
+  if (requestDetails?.requestPackageName !== expectedPackageName
+      || !constantTimeTextEqual(requestDetails?.requestHash, expectedRequestHash)) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_request_mismatch',
+      'The Android security proof did not match this request.',
+    );
+  }
+  if (!Number.isSafeInteger(requestTimestamp)
+      || at.getTime() - requestTimestamp > tokenTTLMilliseconds
+      || requestTimestamp - at.getTime() > futureToleranceMilliseconds) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_token_stale',
+      'The Android security proof expired. Please try again.',
+    );
+  }
+
+  const appIntegrity = verdict?.appIntegrity;
+  if (appIntegrity?.appRecognitionVerdict !== 'PLAY_RECOGNIZED'
+      || appIntegrity?.packageName !== expectedPackageName) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_app_unrecognized',
+      'Install or update My Path through Google Play, then try again.',
+    );
+  }
+  if (!/^\d+$/.test(String(appIntegrity?.versionCode || ''))) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_version_invalid',
+      'The installed Android app version could not be verified.',
+    );
+  }
+
+  if (acceptedCertificateDigests.size > 0) {
+    const verdictDigests = new Set(
+      (Array.isArray(appIntegrity?.certificateSha256Digest)
+        ? appIntegrity.certificateSha256Digest
+        : [])
+        .map(normalizedCertificateDigest)
+        .filter(Boolean),
+    );
+    const certificateMatches = [...acceptedCertificateDigests]
+      .map(normalizedCertificateDigest)
+      .some((digest) => verdictDigests.has(digest));
+    if (!certificateMatches) {
+      throw new PlayIntegrityRequestError(
+        'play_integrity_certificate_mismatch',
+        'The installed Android app signature could not be verified.',
+      );
+    }
+  }
+
+  const deviceVerdicts = Array.isArray(verdict?.deviceIntegrity?.deviceRecognitionVerdict)
+    ? verdict.deviceIntegrity.deviceRecognitionVerdict
+    : [];
+  if (!deviceVerdicts.includes('MEETS_DEVICE_INTEGRITY')) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_device_untrusted',
+      'This device did not pass Google Play integrity checks.',
+    );
+  }
+  if (verdict?.accountDetails?.appLicensingVerdict !== 'LICENSED') {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_license_required',
+      'Install My Path from Google Play using your signed-in account, then try again.',
+    );
+  }
+
+  return {
+    verified: true,
+    platform: 'android',
+    versionCode: Number(appIntegrity.versionCode),
+  };
+}
+
+async function verifyPlayIntegrityRequest({
+  req,
+  pathname,
+  rawBody,
+  identity,
+  at = new Date(),
+  tokenDecoder = decodePlayIntegrityToken,
+  enforcement = playIntegrityEnforcement,
+}) {
+  if (enforcement === 'off') {
+    return { verified: false, platform: 'android', legacy: true };
+  }
+  if (identity.isLegacy) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_player_id_required',
+      'This version requires a secure player identity. Restart the app and try again.',
+    );
+  }
+
+  const token = requestHeader(req, 'x-my-path-play-integrity-token');
+  const suppliedRequestHash = requestHeader(req, 'x-my-path-play-integrity-request-hash');
+  const expectedRequestHash = playIntegrityRequestHash(req.method, pathname, rawBody);
+  if (!token || token.length > 65_536) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_required',
+      'This request could not be verified as coming from the genuine My Path Android app.',
+    );
+  }
+  if (!constantTimeTextEqual(suppliedRequestHash, expectedRequestHash)) {
+    throw new PlayIntegrityRequestError(
+      'play_integrity_request_mismatch',
+      'The Android security proof did not match this request.',
+    );
+  }
+
+  let verdict;
+  try {
+    verdict = await tokenDecoder({ token, packageName: playIntegrityPackageName });
+  } catch (error) {
+    console.warn('Rejected Play Integrity token:', error instanceof Error ? error.message : error);
+    if (error instanceof PlayIntegrityRequestError) throw error;
+    throw new PlayIntegrityRequestError(
+      'play_integrity_token_invalid',
+      'The Android security proof could not be verified.',
+    );
+  }
+  return validatePlayIntegrityVerdict({
+    verdict,
+    expectedRequestHash,
+    expectedPackageName: playIntegrityPackageName,
+    at,
+  });
+}
+
+async function verifyGenuineAppRequest(args) {
+  const platform = requestHeader(args.req, 'x-my-path-platform').toLowerCase();
+  if (platform === 'android') {
+    return verifyPlayIntegrityRequest(args);
+  }
+  if (platform === 'android-debug') {
+    if (process.env.NODE_ENV === 'production') {
+      throw new PlayIntegrityRequestError(
+        'play_integrity_debug_rejected',
+        'Debug Android builds cannot use the production service.',
+      );
+    }
+    return { verified: false, platform: 'android', debug: true };
+  }
+  return verifyAppAttestRequest(args);
+}
+
+function sendGenuineAppError(res, error) {
+  const recognizedError = error instanceof AppAttestRequestError
+    || error instanceof PlayIntegrityRequestError;
+  const statusCode = recognizedError ? error.statusCode : 401;
+  return sendJson(res, statusCode, {
+    error: {
+      code: recognizedError ? error.code : 'app_integrity_failed',
+      message: error instanceof Error
+        ? error.message
+        : 'The request could not be verified as coming from the genuine My Path app.',
+    },
+  }, { 'Cache-Control': 'no-store' });
+}
+
 function sendAppAttestError(res, error) {
   const statusCode = error instanceof AppAttestRequestError ? error.statusCode : 401;
   return sendJson(res, statusCode, {
@@ -664,7 +1003,10 @@ function estimatedChatWalletTokens(body, route, at = new Date()) {
     1,
     100_000,
   );
-  const possibleAttempts = route.kind === 'deepseek' ? 2 : 1;
+  const possibleAttempts = route.kind === 'deepseek'
+    && body?.response_format?.type === 'json_object'
+    ? 2
+    : 1;
   const pricingMultiplier = route.kind === 'deepseek' ? deepSeekPricingMultiplier(at) : 1;
   return (promptEstimate + requestedCompletion) * possibleAttempts * pricingMultiplier;
 }
@@ -1024,12 +1366,12 @@ async function performChatCompletion(body, route) {
 }
 
 function deepSeekResponseNeedsRetry(payload, forwardedBody) {
+  if (forwardedBody.response_format?.type !== 'json_object') {
+    return false;
+  }
   const content = payload?.choices?.[0]?.message?.content;
   if (typeof content !== 'string' || !content.trim()) {
     return true;
-  }
-  if (forwardedBody.response_format?.type !== 'json_object') {
-    return false;
   }
   try {
     const parsed = JSON.parse(content);
@@ -1112,6 +1454,7 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         service: 'AgeUp backend',
+        revision: backendRevision,
         endpoints: [
           '/v1/health/ai',
           '/v1/health/openai',
@@ -1120,6 +1463,7 @@ const server = createServer(async (req, res) => {
           '/v1/chat/completions',
           '/v1/creator-codes/redeem',
           '/v1/player-safety/account-deleted',
+          '/v1/content-reports',
         ],
         models: [...modelRoutes.keys()],
         app_attest: {
@@ -1258,7 +1602,7 @@ const server = createServer(async (req, res) => {
       const day = playerQuotaUTCDateKey(at);
       const identity = playerQuotaIdentity(req);
       try {
-        verifyAppAttestRequest({
+        await verifyGenuineAppRequest({
           req,
           pathname: url.pathname,
           rawBody: parsed.rawBody,
@@ -1266,7 +1610,7 @@ const server = createServer(async (req, res) => {
           at,
         });
       } catch (error) {
-        return sendAppAttestError(res, error);
+        return sendGenuineAppError(res, error);
       }
       const receiptState = verifiedPlayerQuotaReceipt(
         req.headers['x-my-path-quota-receipt'],
@@ -1279,6 +1623,52 @@ const server = createServer(async (req, res) => {
         retained_safety_record: true,
         message: 'Account data can be deleted without resetting the daily AI safety limit.',
       }, quotaHeaders(identity.hash, day, snapshot, at));
+    }
+
+    if (req.method === 'POST' && url.pathname === '/v1/content-reports') {
+      let parsed;
+      try {
+        parsed = await readJsonBody(req);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: { message: error instanceof Error ? error.message : 'Invalid JSON body.' },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      const at = new Date();
+      const identity = playerQuotaIdentity(req);
+      try {
+        await verifyGenuineAppRequest({
+          req,
+          pathname: url.pathname,
+          rawBody: parsed.rawBody,
+          identity,
+          at,
+        });
+      } catch (error) {
+        return sendGenuineAppError(res, error);
+      }
+
+      let report;
+      try {
+        report = normalizeAIContentReport(parsed.body);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: { message: error instanceof Error ? error.message : 'Invalid content report.' },
+        }, { 'Cache-Control': 'no-store' });
+      }
+      if (!claimAIContentReportSlot(identity.hash, at)) {
+        return sendJson(res, 429, {
+          error: { message: 'Too many content reports today. Try again tomorrow.' },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      const result = recordAIContentReport(report, at);
+      return sendJson(res, 201, {
+        ok: true,
+        report_id: result.report_id,
+        message: 'Report counted. No story text or identifying story details were uploaded.',
+      }, { 'Cache-Control': 'no-store' });
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/creator-codes/redeem') {
@@ -1305,14 +1695,14 @@ const server = createServer(async (req, res) => {
 
       const identity = playerQuotaIdentity(req);
       try {
-        verifyAppAttestRequest({
+        await verifyGenuineAppRequest({
           req,
           pathname: url.pathname,
           rawBody,
           identity,
         });
       } catch (error) {
-        return sendAppAttestError(res, error);
+        return sendGenuineAppError(res, error);
       }
 
       let catalog;
@@ -1410,7 +1800,7 @@ const server = createServer(async (req, res) => {
       const quotaDay = playerQuotaUTCDateKey(quotaAt);
       const quotaIdentity = playerQuotaIdentity(req);
       try {
-        verifyAppAttestRequest({
+        await verifyGenuineAppRequest({
           req,
           pathname: url.pathname,
           rawBody,
@@ -1418,7 +1808,7 @@ const server = createServer(async (req, res) => {
           at: quotaAt,
         });
       } catch (error) {
-        return sendAppAttestError(res, error);
+        return sendGenuineAppError(res, error);
       }
       if (!route.apiKey) {
         return sendJson(res, 503, {
@@ -1507,6 +1897,7 @@ if (isMainModule) {
 
 export {
   AppAttestRequestError,
+  PlayIntegrityRequestError,
   PlayerUsageLedger,
   actualChatWalletTokens,
   appAttestChallengeToken,
@@ -1519,6 +1910,7 @@ export {
   deepSeekResponseNeedsRetry,
   forwardedChatBody,
   mergedUsage,
+  normalizeAIContentReport,
   modelRoutes,
   normalizePlayerIdentifier,
   normalizeCreatorCode,
@@ -1527,7 +1919,9 @@ export {
   playerQuotaHash,
   playerQuotaReceipt,
   playerQuotaUTCDateKey,
+  playIntegrityRequestHash,
   recordCreatorCodeFailure,
+  recordAIContentReport,
   resolveCreatorCode,
   routeForModel,
   server,
@@ -1535,5 +1929,8 @@ export {
   verifiedAppAttestChallengeToken,
   verifiedPlayerQuotaReceipt,
   verifyAppAttestRequest,
+  validatePlayIntegrityVerdict,
+  verifyGenuineAppRequest,
+  verifyPlayIntegrityRequest,
   estimatedChatWalletTokens,
 };

@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   AppAttestRequestError,
+  PlayIntegrityRequestError,
   PlayerUsageLedger,
   actualChatWalletTokens,
   appAttestClientData,
@@ -20,15 +21,62 @@ import {
   forwardedChatBody,
   issueAppAttestChallenges,
   mergedUsage,
+  normalizeAIContentReport,
   normalizeModelName,
   normalizePlayerIdentifier,
   playerQuotaHash,
   playerQuotaReceipt,
+  playIntegrityRequestHash,
+  recordAIContentReport,
   routeForModel,
+  validatePlayIntegrityVerdict,
   verifiedAppAttestChallengeToken,
   verifiedPlayerQuotaReceipt,
   verifyAppAttestRequest,
+  verifyGenuineAppRequest,
+  verifyPlayIntegrityRequest,
 } from './server.mjs';
+
+test('AI content reports contain no story text or identifying story details', () => {
+  const normalized = normalizeAIContentReport({
+    source: 'life_description',
+    model: 'gpt-4o-mini',
+    category: 'offensive_or_inappropriate',
+  });
+  assert.deepEqual(normalized, {
+    source: 'life_description',
+    model: 'gpt-4o-mini',
+    category: 'offensive_or_inappropriate',
+  });
+
+  for (const forbidden of [
+    { content: 'private story text' },
+    { content_sha256: 'A'.repeat(43) },
+    { event_id: '866f9714-c058-4d2d-bf34-93f57086e437' },
+    { language: 'english' },
+  ]) {
+    assert.throws(
+      () => normalizeAIContentReport({ ...normalized, ...forbidden }),
+      /must not include/i,
+    );
+  }
+});
+
+test('AI content reports are counted only as anonymous daily aggregates', () => {
+  const report = normalizeAIContentReport({
+    source: 'popup_description',
+    model: 'deepseek-v4-pro',
+    category: 'offensive_or_inappropriate',
+  });
+  const at = new Date('2038-04-17T12:00:00Z');
+  const first = recordAIContentReport(report, at);
+  const second = recordAIContentReport(report, at);
+  assert.match(first.report_id, /^[0-9a-f]{24}$/);
+  assert.equal(first.aggregate_count, 1);
+  assert.equal(second.aggregate_count, 2);
+  assert.equal(Object.hasOwn(second, 'player_hash'), false);
+  assert.equal(Object.hasOwn(second, 'content'), false);
+});
 
 test('normalizes creator codes without exposing formatting differences', () => {
   assert.equal(normalizeCreatorCode(' bryce-launch 2026 '), 'BRYCELAUNCH2026');
@@ -179,6 +227,8 @@ test('leaves the existing GPT request format intact', () => {
 
 test('retries only empty or malformed DeepSeek JSON and combines usage', () => {
   const jsonBody = { response_format: { type: 'json_object' } };
+  const proseBody = {};
+  assert.equal(deepSeekResponseNeedsRetry({ choices: [{ message: { content: '' } }] }, proseBody), false);
   assert.equal(deepSeekResponseNeedsRetry({ choices: [{ message: { content: '' } }] }, jsonBody), true);
   assert.equal(deepSeekResponseNeedsRetry({ choices: [{ message: { content: 'not json' } }] }, jsonBody), true);
   assert.equal(deepSeekResponseNeedsRetry({ choices: [{ message: { content: '{"ok":true}' } }] }, jsonBody), false);
@@ -289,6 +339,22 @@ test('reserves conservatively but reconciles against actual provider usage', () 
     estimatedChatWalletTokens(body, routeForModel('gpt-4o-mini')),
     serializedBytes + 750,
   );
+  assert.equal(
+    estimatedChatWalletTokens(
+      { ...body, model: 'deepseek-v4-pro' },
+      routeForModel('deepseek-v4-pro'),
+      new Date('2026-08-01T12:00:00Z'),
+    ),
+    serializedBytes + 750,
+  );
+  assert.equal(
+    estimatedChatWalletTokens(
+      { ...body, model: 'deepseek-v4-pro', response_format: { type: 'json_object' } },
+      routeForModel('deepseek-v4-pro'),
+      new Date('2026-08-01T12:00:00Z'),
+    ),
+    (serializedBytes + 750) * 2,
+  );
 
   const deepSeekUsage = { usage: { prompt_tokens: 800, completion_tokens: 200 } };
   assert.equal(
@@ -357,6 +423,188 @@ test('App Attest request binding changes with the method, path, or exact body by
     baseline,
     appAttestClientData('challenge-value', 'POST', '/v1/example', Buffer.from('{ "answer": 42 }')),
   );
+});
+
+test('Play Integrity request binding matches the Android client byte format', () => {
+  const rawBody = Buffer.from('{"answer":42}');
+  assert.equal(
+    playIntegrityRequestHash('POST', '/v1/chat/completions', rawBody),
+    'SrwOtJMCosuoFqVhhwxLxMaAk7hbCKwMJgqsq_HAhO0',
+  );
+  assert.notEqual(
+    playIntegrityRequestHash('POST', '/v1/chat/completions', Buffer.from('{ "answer": 42 }')),
+    'SrwOtJMCosuoFqVhhwxLxMaAk7hbCKwMJgqsq_HAhO0',
+  );
+});
+
+function validPlayIntegrityVerdict(requestHash, at = new Date('2026-08-03T12:00:00Z')) {
+  return {
+    requestDetails: {
+      requestPackageName: 'com.brycebehncke.ageup',
+      requestHash,
+      timestampMillis: String(at.getTime()),
+    },
+    accountDetails: { appLicensingVerdict: 'LICENSED' },
+    appIntegrity: {
+      appRecognitionVerdict: 'PLAY_RECOGNIZED',
+      packageName: 'com.brycebehncke.ageup',
+      certificateSha256Digest: ['release-certificate'],
+      versionCode: '7',
+    },
+    deviceIntegrity: {
+      deviceRecognitionVerdict: ['MEETS_DEVICE_INTEGRITY'],
+    },
+  };
+}
+
+test('accepts a fresh, licensed, recognized Play Integrity verdict', () => {
+  const at = new Date('2026-08-03T12:00:00Z');
+  const requestHash = 'bound-request-hash';
+  assert.deepEqual(
+    validatePlayIntegrityVerdict({
+      verdict: validPlayIntegrityVerdict(requestHash, at),
+      expectedRequestHash: requestHash,
+      at,
+      acceptedCertificateDigests: new Set(['release-certificate']),
+    }),
+    { verified: true, platform: 'android', versionCode: 7 },
+  );
+});
+
+test('rejects altered, stale, unlicensed, unrecognized, or untrusted Android requests', () => {
+  const at = new Date('2026-08-03T12:00:00Z');
+  const requestHash = 'bound-request-hash';
+  const parameters = {
+    expectedRequestHash: requestHash,
+    at,
+    tokenTTLMilliseconds: 120_000,
+    acceptedCertificateDigests: new Set(['release-certificate']),
+  };
+
+  const altered = validPlayIntegrityVerdict('different-request', at);
+  assert.throws(
+    () => validatePlayIntegrityVerdict({ ...parameters, verdict: altered }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_request_mismatch',
+  );
+
+  const stale = validPlayIntegrityVerdict(requestHash, new Date(at.getTime() - 120_001));
+  assert.throws(
+    () => validatePlayIntegrityVerdict({ ...parameters, verdict: stale }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_token_stale',
+  );
+
+  const unlicensed = validPlayIntegrityVerdict(requestHash, at);
+  unlicensed.accountDetails.appLicensingVerdict = 'UNLICENSED';
+  assert.throws(
+    () => validatePlayIntegrityVerdict({ ...parameters, verdict: unlicensed }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_license_required',
+  );
+
+  const unrecognized = validPlayIntegrityVerdict(requestHash, at);
+  unrecognized.appIntegrity.appRecognitionVerdict = 'UNRECOGNIZED_VERSION';
+  assert.throws(
+    () => validatePlayIntegrityVerdict({ ...parameters, verdict: unrecognized }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_app_unrecognized',
+  );
+
+  const untrusted = validPlayIntegrityVerdict(requestHash, at);
+  untrusted.deviceIntegrity.deviceRecognitionVerdict = [];
+  assert.throws(
+    () => validatePlayIntegrityVerdict({ ...parameters, verdict: untrusted }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_device_untrusted',
+  );
+
+  const wrongCertificate = validPlayIntegrityVerdict(requestHash, at);
+  assert.throws(
+    () => validatePlayIntegrityVerdict({
+      ...parameters,
+      verdict: wrongCertificate,
+      acceptedCertificateDigests: new Set(['different-certificate']),
+    }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_certificate_mismatch',
+  );
+});
+
+test('decodes Android proof only after checking the exact request hash', async () => {
+  const at = new Date('2026-08-03T12:00:00Z');
+  const rawBody = Buffer.from('{"model":"gpt-4o-mini"}');
+  const requestHash = playIntegrityRequestHash('POST', '/v1/chat/completions', rawBody);
+  const req = {
+    method: 'POST',
+    headers: {
+      'x-my-path-platform': 'android',
+      'x-my-path-play-integrity-token': 'decoded-by-google',
+      'x-my-path-play-integrity-request-hash': requestHash,
+    },
+  };
+  const identity = {
+    identifier: '866f9714-c058-4d2d-bf34-93f57086e437',
+    hash: playerQuotaHash('866f9714-c058-4d2d-bf34-93f57086e437'),
+    isLegacy: false,
+  };
+  let decoderCalls = 0;
+  const tokenDecoder = async ({ token, packageName }) => {
+    decoderCalls += 1;
+    assert.equal(token, 'decoded-by-google');
+    assert.equal(packageName, 'com.brycebehncke.ageup');
+    return validPlayIntegrityVerdict(requestHash, at);
+  };
+
+  assert.deepEqual(
+    await verifyPlayIntegrityRequest({
+      req,
+      pathname: '/v1/chat/completions',
+      rawBody,
+      identity,
+      at,
+      tokenDecoder,
+    }),
+    { verified: true, platform: 'android', versionCode: 7 },
+  );
+  assert.equal(decoderCalls, 1);
+
+  await assert.rejects(
+    verifyPlayIntegrityRequest({
+      req,
+      pathname: '/v1/chat/completions',
+      rawBody: Buffer.from('{"model":"deepseek-v4-pro"}'),
+      identity,
+      at,
+      tokenDecoder,
+    }),
+    (error) => error instanceof PlayIntegrityRequestError
+      && error.code === 'play_integrity_request_mismatch',
+  );
+  assert.equal(decoderCalls, 1);
+});
+
+test('never accepts the Android debug bypass on a production backend', async () => {
+  const originalNodeEnvironment = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  try {
+    await assert.rejects(
+      verifyGenuineAppRequest({
+        req: {
+          method: 'POST',
+          headers: { 'x-my-path-platform': 'android-debug' },
+        },
+        pathname: '/v1/chat/completions',
+        rawBody: Buffer.from('{}'),
+        identity: { isLegacy: false },
+      }),
+      (error) => error instanceof PlayIntegrityRequestError
+        && error.code === 'play_integrity_debug_rejected',
+    );
+  } finally {
+    if (originalNodeEnvironment === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnvironment;
+  }
 });
 
 test('App Attest enforcement supports rollout builds and a strict production switch', () => {

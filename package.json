@@ -9,6 +9,7 @@
     "test": "node --test server.test.mjs"
   },
   "dependencies": {
+    "google-auth-library": "^10.3.0",
     "node-app-attest": "1.0.1"
   },
   "engines": {
