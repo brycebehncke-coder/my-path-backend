@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'deepseek-age-v1';
+const backendRevision = 'gpt5-mini-routing-v1';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -117,6 +117,15 @@ const modelRoutes = new Map([
     apiKey: openaiApiKey,
     missingKeyName: 'OPENAI_API_KEY',
     upstreamModel: 'gpt-4o-mini',
+    chatURL: 'https://api.openai.com/v1/chat/completions',
+    healthURL: 'https://api.openai.com/v1/models',
+  }],
+  ['gpt-5-mini', {
+    kind: 'openai-gpt5',
+    provider: 'OpenAI',
+    apiKey: openaiApiKey,
+    missingKeyName: 'OPENAI_API_KEY',
+    upstreamModel: 'gpt-5-mini',
     chatURL: 'https://api.openai.com/v1/chat/completions',
     healthURL: 'https://api.openai.com/v1/models',
   }],
@@ -1326,6 +1335,14 @@ function forwardedChatBody(body, route) {
     model: route.upstreamModel,
   };
   delete forwarded.provider;
+
+  if (route.kind === 'openai-gpt5') {
+    if (forwarded.max_completion_tokens == null && forwarded.max_tokens != null) {
+      forwarded.max_completion_tokens = forwarded.max_tokens;
+    }
+    delete forwarded.max_tokens;
+    forwarded.reasoning_effort = forwarded.reasoning_effort || 'minimal';
+  }
 
   if (route.kind === 'deepseek') {
     delete forwarded.prompt_cache_key;

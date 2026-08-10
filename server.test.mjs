@@ -162,12 +162,46 @@ test('attaches peak pricing only to successful DeepSeek usage payloads', () => {
   assert.equal(openAIPayload.provider, 'OpenAI');
   assert.equal(openAIPayload.requested_model, 'gpt-4o-mini');
   assert.equal('wallet_token_multiplier' in openAIPayload.usage, false);
+
+  const gpt5MiniPayload = { usage: { total_tokens: 1_000 } };
+  attachPricingMetadata(
+    gpt5MiniPayload,
+    routeForModel('gpt-5-mini'),
+    new Date('2026-07-21T06:30:00Z'),
+  );
+  assert.equal(gpt5MiniPayload.provider, 'OpenAI');
+  assert.equal(gpt5MiniPayload.requested_model, 'gpt-5-mini');
+  assert.equal('wallet_token_multiplier' in gpt5MiniPayload.usage, false);
 });
 
 test('normalizes the former OpenRouter model id to direct DeepSeek', () => {
   assert.equal(normalizeModelName('deepseek/deepseek-v4-pro'), 'deepseek-v4-pro');
   assert.equal(normalizeModelName('deepseek-v4-pro'), 'deepseek-v4-pro');
   assert.equal(routeForModel('deepseek/deepseek-v4-pro')?.provider, 'DeepSeek');
+});
+
+test('routes GPT-5 mini directly to OpenAI with its compatible low-latency fields', () => {
+  const body = {
+    model: 'gpt-5-mini',
+    messages: [{ role: 'user', content: 'Simulate the next year.' }],
+    max_tokens: 750,
+    prompt_cache_key: 'life-123',
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'reply', strict: true, schema: { type: 'object' } },
+    },
+  };
+
+  const route = routeForModel('gpt-5-mini');
+  const forwarded = forwardedChatBody(body, route);
+
+  assert.equal(route.provider, 'OpenAI');
+  assert.equal(forwarded.model, 'gpt-5-mini');
+  assert.equal(forwarded.max_completion_tokens, 750);
+  assert.equal('max_tokens' in forwarded, false);
+  assert.equal(forwarded.reasoning_effort, 'minimal');
+  assert.equal(forwarded.prompt_cache_key, 'life-123');
+  assert.equal(forwarded.response_format.type, 'json_schema');
 });
 
 test('adapts strict schema requests for the direct DeepSeek API', () => {
