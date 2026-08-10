@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-birth-probe-v3';
+const backendRevision = 'gpt5-mini-birth-probe-v4';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -183,11 +183,8 @@ async function runGPT5MiniStartupCompletionProbe() {
   }, route);
   const structuredBody = forwardedChatBody({
     model: 'gpt-5-mini',
-    messages: [
-      { role: 'system', content: 'Return exactly {"narration":String} and nothing else.' },
-      { role: 'user', content: 'Write one complete sentence about a newborn arriving home.' },
-    ],
-    max_tokens: 360,
+    messages,
+    max_tokens: 700,
     response_format: {
       type: 'json_schema',
       json_schema: {
