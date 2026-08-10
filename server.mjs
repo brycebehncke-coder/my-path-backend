@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-birth-probe-v5';
+const backendRevision = 'gpt5-mini-birth-probe-v6';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -168,11 +168,11 @@ async function runGPT5MiniStartupCompletionProbe() {
   const messages = [
     {
       role: 'system',
-      content: 'Simulate the opening of a creative life simulator. The player is born as a baby, and later Age presses move life forward about one year at a time. Describe the birth, immediate family, home, and surrounding world naturally and creatively from the supplied facts. Use close second-person present tense with you and your. Return only the finished narration with no label, JSON, markdown, or commentary.',
+      content: 'Simulate the opening of a creative life simulator. The player is born as a baby, and later Age presses move life forward about one year at a time. Describe the birth, immediate family, home, and surrounding world naturally and creatively from the supplied facts. Use close second-person present tense with you and your. Write one complete paragraph of 4-6 sentences and no more than 160 words. Return exactly {"narration":String} and nothing else.',
     },
     {
       role: 'user',
-      content: 'Simulate this life beginning with the player being born as a baby. Opening location and date: You are born in Detroit, United States on August 10, 2026. Canonical record: Player: Avery Morgan, baby girl. Mother: Dana Morgan, age 31, alive, nurse. Father: Elliot Morgan, age 34, alive, electrician. Brother: Noah Morgan, age 4. Pet: Buddy, Border Collie, age 3. Keep every supplied fact true while making the family and setting feel alive.',
+      content: 'Simulate this life beginning with the player being born as a baby. Be creative and make the family and setting feel alive while keeping these supplied facts true. Opening location and date: You are born in Detroit, United States on August 10, 2026. Canonical record. The story must agree with every field below and must not invent or rename relatives or pets. Player: Avery Morgan | gender: Female | exact birthday: August 10, 2026 | city: Detroit | country: United States | ISO2: US. Care arrangement: biological_parents. Household class: working class. Local setting: a modest brick house in Detroit. Parents: Parent 1: Dana Morgan | exact relation: mother | gender: Female | age: 31 | alive: true | job: nurse | death cause: none. Parent 2: Elliot Morgan | exact relation: father | gender: Male | age: 34 | alive: true | job: electrician | death cause: none. Siblings: Sibling 1: Noah Morgan | exact relation: brother | gender: Male | age when player is born: 4. Pets: Pet 1: Buddy | species: Border Collie | age: 3 | alive: true.',
     },
   ];
   const plainBody = forwardedChatBody({
@@ -184,7 +184,8 @@ async function runGPT5MiniStartupCompletionProbe() {
   const structuredBody = forwardedChatBody({
     model: 'gpt-5-mini',
     messages,
-    max_tokens: 1_600,
+    max_tokens: 1_200,
+    verbosity: 'low',
     response_format: {
       type: 'json_schema',
       json_schema: {
