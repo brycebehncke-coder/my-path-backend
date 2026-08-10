@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-completion-probe-v2';
+const backendRevision = 'gpt5-mini-birth-probe-v3';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -146,7 +146,7 @@ const startupCompletionProbe = {
   structured_output: null,
 };
 
-function summarizedCompletionProbe(result) {
+function summarizedCompletionProbe(result, durationMilliseconds = null) {
   const content = result.payload?.choices?.[0]?.message?.content;
   return {
     ok: result.ok && typeof content === 'string' && content.trim().length > 0,
@@ -154,6 +154,7 @@ function summarizedCompletionProbe(result) {
     content_length: typeof content === 'string' ? content.trim().length : 0,
     finish_reason: result.payload?.choices?.[0]?.finish_reason || null,
     error_code: result.payload?.error?.code || null,
+    duration_ms: durationMilliseconds,
   };
 }
 
@@ -165,13 +166,19 @@ async function runGPT5MiniStartupCompletionProbe() {
   }
 
   const messages = [
-    { role: 'system', content: 'Write only the requested short sentence.' },
-    { role: 'user', content: 'Write one complete sentence about a newborn arriving home.' },
+    {
+      role: 'system',
+      content: 'Simulate the opening of a creative life simulator. The player is born as a baby, and later Age presses move life forward about one year at a time. Describe the birth, immediate family, home, and surrounding world naturally and creatively from the supplied facts. Use close second-person present tense with you and your. Return only the finished narration with no label, JSON, markdown, or commentary.',
+    },
+    {
+      role: 'user',
+      content: 'Simulate this life beginning with the player being born as a baby. Opening location and date: You are born in Detroit, United States on August 10, 2026. Canonical record: Player: Avery Morgan, baby girl. Mother: Dana Morgan, age 31, alive, nurse. Father: Elliot Morgan, age 34, alive, electrician. Brother: Noah Morgan, age 4. Pet: Buddy, Border Collie, age 3. Keep every supplied fact true while making the family and setting feel alive.',
+    },
   ];
   const plainBody = forwardedChatBody({
     model: 'gpt-5-mini',
     messages,
-    max_tokens: 160,
+    max_tokens: 700,
     stream: false,
   }, route);
   const structuredBody = forwardedChatBody({
@@ -198,10 +205,18 @@ async function runGPT5MiniStartupCompletionProbe() {
   }, route);
 
   try {
+    const plainStartedAt = Date.now();
     const plainResult = await performChatCompletion(plainBody, route);
-    startupCompletionProbe.plain_text = summarizedCompletionProbe(plainResult);
+    startupCompletionProbe.plain_text = summarizedCompletionProbe(
+      plainResult,
+      Date.now() - plainStartedAt,
+    );
+    const structuredStartedAt = Date.now();
     const structuredResult = await performChatCompletion(structuredBody, route);
-    startupCompletionProbe.structured_output = summarizedCompletionProbe(structuredResult);
+    startupCompletionProbe.structured_output = summarizedCompletionProbe(
+      structuredResult,
+      Date.now() - structuredStartedAt,
+    );
     startupCompletionProbe.state = startupCompletionProbe.plain_text.ok
       && startupCompletionProbe.structured_output.ok
       ? 'healthy'
