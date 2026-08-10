@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-birth-probe-v7';
+const backendRevision = 'gpt5-mini-birth-probe-v8';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -92,6 +92,8 @@ const aiContentReportMaximumPerPlayerPerDay = configuredPositiveInteger(
 const aiContentReportCountsByPlayerDay = new Map();
 const aiContentReportAggregateCounts = new Map();
 const aiContentReportCategories = new Set(['offensive_or_inappropriate']);
+const gpt5MiniBirthNarrationTokenBudget = 700;
+const gpt5MiniBirthNarrationInstruction = 'Write one complete paragraph of 4-6 complete sentences and no more than 160 words. Return the visible birth opening immediately, preserve every supplied fact, and follow the requested response format exactly.';
 
 const creatorCodeRewardTypes = new Set([
   'ai_tokens',
@@ -168,7 +170,7 @@ async function runGPT5MiniStartupCompletionProbe() {
   const messages = [
     {
       role: 'system',
-      content: 'Simulate the opening of a creative life simulator. The player is born as a baby, and later Age presses move life forward about one year at a time. Describe the birth, immediate family, home, and surrounding world naturally and creatively from the supplied facts. Use close second-person present tense with you and your. Write one complete paragraph of 4-6 sentences and no more than 160 words. Return exactly {"narration":String} and nothing else.',
+      content: 'Simulate the opening of a creative life simulator. The player is born as a baby, and later Age presses move life forward about one year at a time. Describe the birth, immediate family, home, and surrounding world naturally and creatively from the supplied facts. Use close second-person present tense with you and your. Return only the finished narration with no label, JSON, markdown, or commentary.',
     },
     {
       role: 'user',
@@ -1097,10 +1099,11 @@ function estimatedChatWalletTokens(body, route, at = new Date()) {
     1,
     100_000,
   );
-  const possibleAttempts = route.kind === 'deepseek'
-    && body?.response_format?.type === 'json_object'
-    ? 2
-    : 1;
+  const possibleAttempts = (
+    route.kind === 'deepseek' && body?.response_format?.type === 'json_object'
+  ) || (
+    route.kind === 'openai-gpt5' && isGPT5MiniBirthNarrationRequest(body)
+  ) ? 2 : 1;
   const pricingMultiplier = route.kind === 'deepseek' ? deepSeekPricingMultiplier(at) : 1;
   return (promptEstimate + requestedCompletion) * possibleAttempts * pricingMultiplier;
 }
@@ -1427,6 +1430,13 @@ function forwardedChatBody(body, route) {
     }
     delete forwarded.max_tokens;
     forwarded.reasoning_effort = forwarded.reasoning_effort || 'minimal';
+    if (isGPT5MiniBirthNarrationRequest(forwarded)) {
+      forwarded.verbosity = 'low';
+      forwarded.messages = appendSystemInstruction(
+        forwarded.messages,
+        gpt5MiniBirthNarrationInstruction,
+      );
+    }
   }
 
   if (route.kind === 'deepseek') {
@@ -1483,6 +1493,55 @@ function deepSeekResponseNeedsRetry(payload, forwardedBody) {
   }
 }
 
+function isGPT5MiniBirthNarrationRequest(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const systemText = messages
+    .filter((message) => message?.role === 'system')
+    .map((message) => String(message?.content || ''))
+    .join('\n')
+    .toLowerCase();
+  const isBirthOpening = systemText.includes('opening of a creative life simulator')
+    && systemText.includes('born as a baby');
+  if (!isBirthOpening) {
+    return false;
+  }
+
+  const responseFormat = body?.response_format;
+  if (!responseFormat) {
+    return true;
+  }
+  const properties = responseFormat?.json_schema?.schema?.properties;
+  return properties
+    && typeof properties === 'object'
+    && Object.keys(properties).length === 1
+    && typeof properties.narration === 'object';
+}
+
+function gpt5MiniBirthResponseNeedsRetry(payload, forwardedBody) {
+  if (!isGPT5MiniBirthNarrationRequest(forwardedBody)) {
+    return false;
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  const finishReason = payload?.choices?.[0]?.finish_reason;
+  return (typeof content !== 'string' || !content.trim()) && finishReason === 'length';
+}
+
+function gpt5MiniBirthRetryBody(forwardedBody) {
+  return {
+    ...forwardedBody,
+    max_completion_tokens: Math.max(
+      Number(forwardedBody?.max_completion_tokens) || 0,
+      gpt5MiniBirthNarrationTokenBudget,
+    ),
+    reasoning_effort: 'minimal',
+    verbosity: 'low',
+    messages: appendSystemInstruction(
+      forwardedBody.messages,
+      `The prior generation used its entire limit without returning visible text. ${gpt5MiniBirthNarrationInstruction}`,
+    ),
+  };
+}
+
 function mergedUsage(firstUsage, secondUsage) {
   if (!firstUsage && !secondUsage) {
     return undefined;
@@ -1509,17 +1568,28 @@ function mergedUsage(firstUsage, secondUsage) {
 async function proxyChatCompletion(body, route) {
   const forwarded = forwardedChatBody(body, route);
   const first = await performChatCompletion(forwarded, route);
-  if (route.kind !== 'deepseek' || !first.ok || !deepSeekResponseNeedsRetry(first.payload, forwarded)) {
+  if (!first.ok) {
     return first;
   }
 
-  const retryInstruction = forwarded.response_format?.type === 'json_object'
-    ? 'The prior generation was empty or invalid. Return the complete valid JSON object now.'
-    : 'The prior generation was empty. Return a complete non-empty answer now.';
-  const retryBody = {
-    ...forwarded,
-    messages: appendSystemInstruction(forwarded.messages, retryInstruction),
-  };
+  let retryBody;
+  if (route.kind === 'deepseek' && deepSeekResponseNeedsRetry(first.payload, forwarded)) {
+    const retryInstruction = forwarded.response_format?.type === 'json_object'
+      ? 'The prior generation was empty or invalid. Return the complete valid JSON object now.'
+      : 'The prior generation was empty. Return a complete non-empty answer now.';
+    retryBody = {
+      ...forwarded,
+      messages: appendSystemInstruction(forwarded.messages, retryInstruction),
+    };
+  } else if (
+    route.kind === 'openai-gpt5'
+    && gpt5MiniBirthResponseNeedsRetry(first.payload, forwarded)
+  ) {
+    retryBody = gpt5MiniBirthRetryBody(forwarded);
+  } else {
+    return first;
+  }
+
   const second = await performChatCompletion(retryBody, route);
   if (second.payload && typeof second.payload === 'object') {
     second.payload.usage = mergedUsage(first.payload?.usage, second.payload.usage);
@@ -2012,6 +2082,9 @@ export {
   creatorCodeRequestIsRateLimited,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
+  gpt5MiniBirthResponseNeedsRetry,
+  gpt5MiniBirthRetryBody,
+  isGPT5MiniBirthNarrationRequest,
   forwardedChatBody,
   mergedUsage,
   normalizeAIContentReport,

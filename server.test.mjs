@@ -19,7 +19,10 @@ import {
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
   forwardedChatBody,
+  gpt5MiniBirthResponseNeedsRetry,
+  gpt5MiniBirthRetryBody,
   issueAppAttestChallenges,
+  isGPT5MiniBirthNarrationRequest,
   mergedUsage,
   normalizeAIContentReport,
   normalizeModelName,
@@ -274,6 +277,83 @@ test('retries only empty or malformed DeepSeek JSON and combines usage', () => {
     ),
     { prompt_tokens: 220, completion_tokens: 30, total_tokens: 250 },
   );
+});
+
+test('recognizes only GPT-5 mini birth narration requests for empty-output recovery', () => {
+  const birthMessages = [
+    {
+      role: 'system',
+      content: 'Simulate the opening of a creative life simulator. The player is born as a baby.',
+    },
+    { role: 'user', content: 'Player: Avery Morgan.' },
+  ];
+  const narrationSchema = {
+    type: 'json_schema',
+    json_schema: {
+      schema: {
+        type: 'object',
+        properties: { narration: { type: 'string' } },
+      },
+    },
+  };
+
+  assert.equal(isGPT5MiniBirthNarrationRequest({ messages: birthMessages }), true);
+  assert.equal(isGPT5MiniBirthNarrationRequest({
+    messages: birthMessages,
+    response_format: narrationSchema,
+  }), true);
+  assert.equal(isGPT5MiniBirthNarrationRequest({
+    messages: birthMessages,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        schema: {
+          properties: {
+            narration: { type: 'string' },
+            parents: { type: 'array' },
+          },
+        },
+      },
+    },
+  }), false);
+  assert.equal(isGPT5MiniBirthNarrationRequest({
+    messages: [{ role: 'system', content: 'Simulate the next year.' }],
+  }), false);
+});
+
+test('retries only empty length-limited GPT-5 mini births with a concise 700-token request', () => {
+  const body = forwardedChatBody({
+    model: 'gpt-5-mini',
+    messages: [
+      {
+        role: 'system',
+        content: 'Simulate the opening of a creative life simulator. The player is born as a baby.',
+      },
+      { role: 'user', content: 'Player: Avery Morgan.' },
+    ],
+    max_tokens: 500,
+  }, routeForModel('gpt-5-mini'));
+
+  assert.equal(body.verbosity, 'low');
+  assert.match(body.messages[0].content, /4-6 complete sentences/);
+  assert.match(body.messages[0].content, /no more than 160 words/);
+
+  assert.equal(gpt5MiniBirthResponseNeedsRetry({
+    choices: [{ message: { content: '' }, finish_reason: 'length' }],
+  }, body), true);
+  assert.equal(gpt5MiniBirthResponseNeedsRetry({
+    choices: [{ message: { content: 'You are born safely.' }, finish_reason: 'stop' }],
+  }, body), false);
+  assert.equal(gpt5MiniBirthResponseNeedsRetry({
+    choices: [{ message: { content: '' }, finish_reason: 'stop' }],
+  }, body), false);
+
+  const retry = gpt5MiniBirthRetryBody(body);
+  assert.equal(retry.max_completion_tokens, 700);
+  assert.equal(retry.reasoning_effort, 'minimal');
+  assert.equal(retry.verbosity, 'low');
+  assert.match(retry.messages[0].content, /4-6 complete sentences/);
+  assert.match(retry.messages[0].content, /no more than 160 words/);
 });
 
 test('accepts only canonical player UUIDs and signs receipts for that player and UTC day', () => {
