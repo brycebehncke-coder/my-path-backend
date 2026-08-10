@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-routing-v1';
+const backendRevision = 'gpt5-mini-completion-probe-v2';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -139,6 +139,78 @@ const modelRoutes = new Map([
     healthURL: 'https://api.deepseek.com/models',
   }],
 ]);
+
+const startupCompletionProbe = {
+  state: 'pending',
+  plain_text: null,
+  structured_output: null,
+};
+
+function summarizedCompletionProbe(result) {
+  const content = result.payload?.choices?.[0]?.message?.content;
+  return {
+    ok: result.ok && typeof content === 'string' && content.trim().length > 0,
+    status: result.status,
+    content_length: typeof content === 'string' ? content.trim().length : 0,
+    finish_reason: result.payload?.choices?.[0]?.finish_reason || null,
+    error_code: result.payload?.error?.code || null,
+  };
+}
+
+async function runGPT5MiniStartupCompletionProbe() {
+  const route = routeForModel('gpt-5-mini');
+  if (!route?.apiKey) {
+    startupCompletionProbe.state = 'missing_api_key';
+    return;
+  }
+
+  const messages = [
+    { role: 'system', content: 'Write only the requested short sentence.' },
+    { role: 'user', content: 'Write one complete sentence about a newborn arriving home.' },
+  ];
+  const plainBody = forwardedChatBody({
+    model: 'gpt-5-mini',
+    messages,
+    max_tokens: 160,
+    stream: false,
+  }, route);
+  const structuredBody = forwardedChatBody({
+    model: 'gpt-5-mini',
+    messages: [
+      { role: 'system', content: 'Return exactly {"narration":String} and nothing else.' },
+      { role: 'user', content: 'Write one complete sentence about a newborn arriving home.' },
+    ],
+    max_tokens: 360,
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'startup_birth_narration_probe',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { narration: { type: 'string' } },
+          required: ['narration'],
+        },
+      },
+    },
+    stream: false,
+  }, route);
+
+  try {
+    const plainResult = await performChatCompletion(plainBody, route);
+    startupCompletionProbe.plain_text = summarizedCompletionProbe(plainResult);
+    const structuredResult = await performChatCompletion(structuredBody, route);
+    startupCompletionProbe.structured_output = summarizedCompletionProbe(structuredResult);
+    startupCompletionProbe.state = startupCompletionProbe.plain_text.ok
+      && startupCompletionProbe.structured_output.ok
+      ? 'healthy'
+      : 'failed';
+  } catch (error) {
+    startupCompletionProbe.state = 'failed';
+    startupCompletionProbe.error = error instanceof Error ? error.name : 'unknown';
+  }
+}
 
 function normalizeModelName(rawModel) {
   const model = typeof rawModel === 'string' ? rawModel.trim() : '';
@@ -1487,6 +1559,7 @@ const server = createServer(async (req, res) => {
           enforcement: appAttestEnforcement,
           required_build: appAttestRequiredBuild,
         },
+        startup_completion_probe: startupCompletionProbe,
       });
     }
 
@@ -1903,6 +1976,7 @@ const isMainModule = Boolean(process.argv[1])
 if (isMainModule) {
   server.listen(port, '0.0.0.0', () => {
     console.log(`AgeUp backend listening on http://0.0.0.0:${port}`);
+    void runGPT5MiniStartupCompletionProbe();
   });
 
   process.on('SIGINT', () => {
