@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-birth-recovery-v1';
+const backendRevision = 'gpt5-mini-age-cache-recovery-v1';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -92,8 +92,10 @@ const aiContentReportMaximumPerPlayerPerDay = configuredPositiveInteger(
 const aiContentReportCountsByPlayerDay = new Map();
 const aiContentReportAggregateCounts = new Map();
 const aiContentReportCategories = new Set(['offensive_or_inappropriate']);
-const gpt5MiniBirthNarrationTokenBudget = 700;
-const gpt5MiniBirthNarrationInstruction = 'Write one complete paragraph of 4-6 complete sentences and no more than 160 words. Return the visible birth opening immediately, preserve every supplied fact, and follow the requested response format exactly.';
+const gpt5MiniBirthNarrationTokenBudget = 1000;
+const gpt5MiniBirthNarrationInstruction = 'Return the complete visible birth opening immediately. Preserve every supplied fact and follow the requested prose length, paragraph rhythm, voice, and response format exactly.';
+const gpt5MiniAnnualAgeTokenBudget = 900;
+const gpt5MiniAnnualAgeInstruction = 'Return a complete non-empty visible Age passage now. Use the supplied life state, finish every sentence, and return prose only.';
 
 const creatorCodeRewardTypes = new Set([
   'ai_tokens',
@@ -131,6 +133,15 @@ const modelRoutes = new Map([
     chatURL: 'https://api.openai.com/v1/chat/completions',
     healthURL: 'https://api.openai.com/v1/models',
   }],
+  ['gpt-5.6-luna', {
+    kind: 'openai-gpt56',
+    provider: 'OpenAI',
+    apiKey: openaiApiKey,
+    missingKeyName: 'OPENAI_API_KEY',
+    upstreamModel: 'gpt-5.6-luna',
+    chatURL: 'https://api.openai.com/v1/chat/completions',
+    healthURL: 'https://api.openai.com/v1/models',
+  }],
   ['deepseek-v4-pro', {
     kind: 'deepseek',
     provider: 'DeepSeek',
@@ -149,6 +160,19 @@ function normalizeModelName(rawModel) {
 
 function routeForModel(rawModel) {
   return modelRoutes.get(normalizeModelName(rawModel));
+}
+
+function isOpenAIReasoningRoute(route) {
+  return route?.kind === 'openai-gpt5' || route?.kind === 'openai-gpt56';
+}
+
+function compatibleOpenAIReasoningEffort(route, rawEffort) {
+  const requested = typeof rawEffort === 'string' ? rawEffort.trim().toLowerCase() : '';
+  if (route?.kind === 'openai-gpt56') {
+    const supported = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+    return supported.has(requested) ? requested : 'none';
+  }
+  return requested || 'minimal';
 }
 
 function deepSeekPricingMultiplier(at = new Date()) {
@@ -1017,7 +1041,7 @@ function estimatedChatWalletTokens(body, route, at = new Date()) {
   const possibleAttempts = (
     route.kind === 'deepseek' && body?.response_format?.type === 'json_object'
   ) || (
-    route.kind === 'openai-gpt5' && isGPT5MiniBirthNarrationRequest(body)
+    isOpenAIReasoningRoute(route) && isGPT5MiniBirthNarrationRequest(body)
   ) ? 2 : 1;
   const pricingMultiplier = route.kind === 'deepseek' ? deepSeekPricingMultiplier(at) : 1;
   return (promptEstimate + requestedCompletion) * possibleAttempts * pricingMultiplier;
@@ -1339,18 +1363,23 @@ function forwardedChatBody(body, route) {
   };
   delete forwarded.provider;
 
-  if (route.kind === 'openai-gpt5') {
+  if (isOpenAIReasoningRoute(route)) {
     if (forwarded.max_completion_tokens == null && forwarded.max_tokens != null) {
       forwarded.max_completion_tokens = forwarded.max_tokens;
     }
     delete forwarded.max_tokens;
-    forwarded.reasoning_effort = forwarded.reasoning_effort || 'minimal';
+    forwarded.reasoning_effort = compatibleOpenAIReasoningEffort(
+      route,
+      forwarded.reasoning_effort,
+    );
     if (isGPT5MiniBirthNarrationRequest(forwarded)) {
-      forwarded.verbosity = 'low';
+      forwarded.verbosity = 'medium';
       forwarded.messages = appendSystemInstruction(
         forwarded.messages,
         gpt5MiniBirthNarrationInstruction,
       );
+    } else if (isGPT5MiniAnnualAgeRequest(forwarded)) {
+      forwarded.verbosity = 'low';
     }
   }
 
@@ -1409,6 +1438,22 @@ function deepSeekResponseNeedsRetry(payload, forwardedBody) {
 }
 
 function isGPT5MiniBirthNarrationRequest(body) {
+  const responseFormat = body?.response_format;
+  const schemaName = String(responseFormat?.json_schema?.name || '').trim();
+  const properties = responseFormat?.json_schema?.schema?.properties;
+  const hasNarrationOnlySchema = properties
+    && typeof properties === 'object'
+    && Object.keys(properties).length === 1
+    && typeof properties.narration === 'object';
+
+  // The schema name is a stable request contract. Prompt wording changes as
+  // narration quality improves, so it must not determine provider settings.
+  if (schemaName === 'gpt5_birth_narration') {
+    return Boolean(hasNarrationOnlySchema);
+  }
+
+  // Retain the legacy prompt check for older app builds that predate the named
+  // birth schema.
   const messages = Array.isArray(body?.messages) ? body.messages : [];
   const systemText = messages
     .filter((message) => message?.role === 'system')
@@ -1421,15 +1466,10 @@ function isGPT5MiniBirthNarrationRequest(body) {
     return false;
   }
 
-  const responseFormat = body?.response_format;
   if (!responseFormat) {
     return true;
   }
-  const properties = responseFormat?.json_schema?.schema?.properties;
-  return properties
-    && typeof properties === 'object'
-    && Object.keys(properties).length === 1
-    && typeof properties.narration === 'object';
+  return Boolean(hasNarrationOnlySchema);
 }
 
 function gpt5MiniBirthResponseNeedsRetry(payload, forwardedBody) {
@@ -1441,18 +1481,56 @@ function gpt5MiniBirthResponseNeedsRetry(payload, forwardedBody) {
   return (typeof content !== 'string' || !content.trim()) && finishReason === 'length';
 }
 
-function gpt5MiniBirthRetryBody(forwardedBody) {
+function gpt5MiniBirthRetryBody(forwardedBody, route = routeForModel(forwardedBody?.model)) {
   return {
     ...forwardedBody,
     max_completion_tokens: Math.max(
       Number(forwardedBody?.max_completion_tokens) || 0,
       gpt5MiniBirthNarrationTokenBudget,
     ),
-    reasoning_effort: 'minimal',
-    verbosity: 'low',
+    reasoning_effort: compatibleOpenAIReasoningEffort(route, forwardedBody?.reasoning_effort),
+    verbosity: 'medium',
     messages: appendSystemInstruction(
       forwardedBody.messages,
       `The prior generation used its entire limit without returning visible text. ${gpt5MiniBirthNarrationInstruction}`,
+    ),
+  };
+}
+
+function isGPT5MiniAnnualAgeRequest(body) {
+  const cacheKey = String(body?.prompt_cache_key || '').trim();
+  if (!cacheKey.startsWith('my-path-gpt5-fast-')) {
+    return false;
+  }
+  const messages = Array.isArray(body?.messages) ? body.messages : [];
+  const systemText = messages
+    .filter((message) => message?.role === 'system')
+    .map((message) => String(message?.content || ''))
+    .join('\n');
+  return systemText.includes('gpt5-mini-annual-age-cache-v1')
+    && systemText.includes('Write only the new visible passage after an Age press');
+}
+
+function gpt5MiniAnnualAgeResponseNeedsRetry(payload, forwardedBody) {
+  if (!isGPT5MiniAnnualAgeRequest(forwardedBody)) {
+    return false;
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  return typeof content !== 'string' || !content.trim();
+}
+
+function gpt5MiniAnnualAgeRetryBody(forwardedBody, route = routeForModel(forwardedBody?.model)) {
+  return {
+    ...forwardedBody,
+    max_completion_tokens: Math.max(
+      Number(forwardedBody?.max_completion_tokens) || 0,
+      gpt5MiniAnnualAgeTokenBudget,
+    ),
+    reasoning_effort: compatibleOpenAIReasoningEffort(route, forwardedBody?.reasoning_effort),
+    verbosity: 'low',
+    messages: appendSystemInstruction(
+      forwardedBody.messages,
+      gpt5MiniAnnualAgeInstruction,
     ),
   };
 }
@@ -1477,6 +1555,21 @@ function mergedUsage(firstUsage, secondUsage) {
       merged[field] = first + second;
     }
   }
+  const promptDetailFields = ['cached_tokens', 'cache_write_tokens'];
+  const promptDetails = {
+    ...(firstUsage?.prompt_tokens_details || {}),
+    ...(secondUsage?.prompt_tokens_details || {}),
+  };
+  for (const field of promptDetailFields) {
+    const first = Number(firstUsage?.prompt_tokens_details?.[field] || 0);
+    const second = Number(secondUsage?.prompt_tokens_details?.[field] || 0);
+    if (first || second) {
+      promptDetails[field] = first + second;
+    }
+  }
+  if (Object.keys(promptDetails).length > 0) {
+    merged.prompt_tokens_details = promptDetails;
+  }
   return merged;
 }
 
@@ -1497,10 +1590,15 @@ async function proxyChatCompletion(body, route) {
       messages: appendSystemInstruction(forwarded.messages, retryInstruction),
     };
   } else if (
-    route.kind === 'openai-gpt5'
+    isOpenAIReasoningRoute(route)
     && gpt5MiniBirthResponseNeedsRetry(first.payload, forwarded)
   ) {
-    retryBody = gpt5MiniBirthRetryBody(forwarded);
+    retryBody = gpt5MiniBirthRetryBody(forwarded, route);
+  } else if (
+    isOpenAIReasoningRoute(route)
+    && gpt5MiniAnnualAgeResponseNeedsRetry(first.payload, forwarded)
+  ) {
+    retryBody = gpt5MiniAnnualAgeRetryBody(forwarded, route);
   } else {
     return first;
   }
@@ -1997,6 +2095,9 @@ export {
   deepSeekResponseNeedsRetry,
   gpt5MiniBirthResponseNeedsRetry,
   gpt5MiniBirthRetryBody,
+  gpt5MiniAnnualAgeResponseNeedsRetry,
+  gpt5MiniAnnualAgeRetryBody,
+  isGPT5MiniAnnualAgeRequest,
   isGPT5MiniBirthNarrationRequest,
   forwardedChatBody,
   mergedUsage,

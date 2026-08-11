@@ -6,7 +6,10 @@ This is the small backend server your iPhone app should talk to instead of stori
 
 - keeps your real `OPENAI_API_KEY` and `DEEPSEEK_API_KEY` on the server only
 - receives requests from the app at `POST /v1/chat/completions`
-- forwards `gpt-4o-mini` to OpenAI
+- forwards `gpt-4o-mini`, `gpt-5-mini`, and `gpt-5.6-luna` to OpenAI
+- gives GPT-5 Mini and GPT-5.6 Luna the same My Path gameplay and birth-request contract
+- translates each OpenAI reasoning model to a compatible low-latency Chat Completions effort
+- preserves GPT-5 Mini Age prompt cache keys and retries once when reasoning returns no visible passage
 - forwards `deepseek-v4-pro` directly to DeepSeek
 - disables DeepSeek thinking mode for lower latency and token cost
 - adapts the app's strict JSON schemas to DeepSeek JSON mode

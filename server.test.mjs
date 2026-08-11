@@ -21,7 +21,10 @@ import {
   forwardedChatBody,
   gpt5MiniBirthResponseNeedsRetry,
   gpt5MiniBirthRetryBody,
+  gpt5MiniAnnualAgeResponseNeedsRetry,
+  gpt5MiniAnnualAgeRetryBody,
   issueAppAttestChallenges,
+  isGPT5MiniAnnualAgeRequest,
   isGPT5MiniBirthNarrationRequest,
   mergedUsage,
   normalizeAIContentReport,
@@ -175,36 +178,22 @@ test('attaches peak pricing only to successful DeepSeek usage payloads', () => {
   assert.equal(gpt5MiniPayload.provider, 'OpenAI');
   assert.equal(gpt5MiniPayload.requested_model, 'gpt-5-mini');
   assert.equal('wallet_token_multiplier' in gpt5MiniPayload.usage, false);
+
+  const gpt56LunaPayload = { usage: { total_tokens: 1_000 } };
+  attachPricingMetadata(
+    gpt56LunaPayload,
+    routeForModel('gpt-5.6-luna'),
+    new Date('2026-07-21T06:30:00Z'),
+  );
+  assert.equal(gpt56LunaPayload.provider, 'OpenAI');
+  assert.equal(gpt56LunaPayload.requested_model, 'gpt-5.6-luna');
+  assert.equal('wallet_token_multiplier' in gpt56LunaPayload.usage, false);
 });
 
 test('normalizes the former OpenRouter model id to direct DeepSeek', () => {
   assert.equal(normalizeModelName('deepseek/deepseek-v4-pro'), 'deepseek-v4-pro');
   assert.equal(normalizeModelName('deepseek-v4-pro'), 'deepseek-v4-pro');
   assert.equal(routeForModel('deepseek/deepseek-v4-pro')?.provider, 'DeepSeek');
-});
-
-test('routes GPT-5 mini directly to OpenAI with its compatible low-latency fields', () => {
-  const body = {
-    model: 'gpt-5-mini',
-    messages: [{ role: 'user', content: 'Simulate the next year.' }],
-    max_tokens: 750,
-    prompt_cache_key: 'life-123',
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'reply', strict: true, schema: { type: 'object' } },
-    },
-  };
-
-  const route = routeForModel('gpt-5-mini');
-  const forwarded = forwardedChatBody(body, route);
-
-  assert.equal(route.provider, 'OpenAI');
-  assert.equal(forwarded.model, 'gpt-5-mini');
-  assert.equal(forwarded.max_completion_tokens, 750);
-  assert.equal('max_tokens' in forwarded, false);
-  assert.equal(forwarded.reasoning_effort, 'minimal');
-  assert.equal(forwarded.prompt_cache_key, 'life-123');
-  assert.equal(forwarded.response_format.type, 'json_schema');
 });
 
 test('adapts strict schema requests for the direct DeepSeek API', () => {
@@ -262,6 +251,59 @@ test('leaves the existing GPT request format intact', () => {
   assert.equal('thinking' in forwarded, false);
 });
 
+test('routes GPT-5 mini directly to OpenAI with its compatible low-latency fields', () => {
+  const body = {
+    model: 'gpt-5-mini',
+    messages: [{ role: 'user', content: 'Simulate the next year.' }],
+    max_tokens: 750,
+    prompt_cache_key: 'life-123',
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'reply', strict: true, schema: { type: 'object' } },
+    },
+  };
+
+  const route = routeForModel('gpt-5-mini');
+  const forwarded = forwardedChatBody(body, route);
+
+  assert.equal(route.provider, 'OpenAI');
+  assert.equal(forwarded.model, 'gpt-5-mini');
+  assert.equal(forwarded.max_completion_tokens, 750);
+  assert.equal('max_tokens' in forwarded, false);
+  assert.equal(forwarded.reasoning_effort, 'minimal');
+  assert.equal(forwarded.prompt_cache_key, 'life-123');
+  assert.equal(forwarded.response_format.type, 'json_schema');
+});
+
+test('routes GPT-5.6 Luna directly to OpenAI without forwarding unsupported minimal effort', () => {
+  const body = {
+    model: 'gpt-5.6-luna',
+    messages: [{ role: 'user', content: 'Simulate the next year.' }],
+    max_tokens: 750,
+    reasoning_effort: 'minimal',
+    prompt_cache_key: 'life-123',
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'reply', strict: true, schema: { type: 'object' } },
+    },
+  };
+
+  const route = routeForModel('gpt-5.6-luna');
+  const forwarded = forwardedChatBody(body, route);
+
+  assert.equal(route.provider, 'OpenAI');
+  assert.equal(forwarded.model, 'gpt-5.6-luna');
+  assert.equal(forwarded.max_completion_tokens, 750);
+  assert.equal('max_tokens' in forwarded, false);
+  assert.equal(forwarded.reasoning_effort, 'none');
+  assert.equal(forwarded.prompt_cache_key, 'life-123');
+  assert.equal(forwarded.response_format.type, 'json_schema');
+
+  const explicitLow = forwardedChatBody({ ...body, reasoning_effort: 'low' }, route);
+  assert.equal(explicitLow.reasoning_effort, 'low');
+  assert.notEqual(explicitLow.reasoning_effort, 'minimal');
+});
+
 test('retries only empty or malformed DeepSeek JSON and combines usage', () => {
   const jsonBody = { response_format: { type: 'json_object' } };
   const proseBody = {};
@@ -290,6 +332,7 @@ test('recognizes only GPT-5 mini birth narration requests for empty-output recov
   const narrationSchema = {
     type: 'json_schema',
     json_schema: {
+      name: 'gpt5_birth_narration',
       schema: {
         type: 'object',
         properties: { narration: { type: 'string' } },
@@ -303,10 +346,20 @@ test('recognizes only GPT-5 mini birth narration requests for empty-output recov
     response_format: narrationSchema,
   }), true);
   assert.equal(isGPT5MiniBirthNarrationRequest({
+    messages: [
+      {
+        role: 'system',
+        content: 'Write a vivid birth opening in four to six short paragraphs.',
+      },
+    ],
+    response_format: narrationSchema,
+  }), true);
+  assert.equal(isGPT5MiniBirthNarrationRequest({
     messages: birthMessages,
     response_format: {
       type: 'json_schema',
       json_schema: {
+        name: 'gpt5_birth_narration',
         schema: {
           properties: {
             narration: { type: 'string' },
@@ -321,9 +374,8 @@ test('recognizes only GPT-5 mini birth narration requests for empty-output recov
   }), false);
 });
 
-test('retries only empty length-limited GPT-5 mini births with a concise 700-token request', () => {
-  const body = forwardedChatBody({
-    model: 'gpt-5-mini',
+test('retries empty length-limited GPT-5 births with model-compatible effort and full budget', () => {
+  const request = {
     messages: [
       {
         role: 'system',
@@ -332,11 +384,14 @@ test('retries only empty length-limited GPT-5 mini births with a concise 700-tok
       { role: 'user', content: 'Player: Avery Morgan.' },
     ],
     max_tokens: 500,
-  }, routeForModel('gpt-5-mini'));
+  };
+  const miniRoute = routeForModel('gpt-5-mini');
+  const body = forwardedChatBody({ ...request, model: 'gpt-5-mini' }, miniRoute);
 
-  assert.equal(body.verbosity, 'low');
-  assert.match(body.messages[0].content, /4-6 complete sentences/);
-  assert.match(body.messages[0].content, /no more than 160 words/);
+  assert.equal(body.verbosity, 'medium');
+  assert.match(body.messages[0].content, /complete visible birth opening/);
+  assert.match(body.messages[0].content, /paragraph rhythm/);
+  assert.doesNotMatch(body.messages[0].content, /one complete paragraph/);
 
   assert.equal(gpt5MiniBirthResponseNeedsRetry({
     choices: [{ message: { content: '' }, finish_reason: 'length' }],
@@ -348,12 +403,98 @@ test('retries only empty length-limited GPT-5 mini births with a concise 700-tok
     choices: [{ message: { content: '' }, finish_reason: 'stop' }],
   }, body), false);
 
-  const retry = gpt5MiniBirthRetryBody(body);
-  assert.equal(retry.max_completion_tokens, 700);
+  const retry = gpt5MiniBirthRetryBody(body, miniRoute);
+  assert.equal(retry.max_completion_tokens, 1000);
+  assert.equal(retry.reasoning_effort, 'minimal');
+  assert.equal(retry.verbosity, 'medium');
+  assert.match(retry.messages[0].content, /complete visible birth opening/);
+  assert.match(retry.messages[0].content, /paragraph rhythm/);
+  assert.doesNotMatch(retry.messages[0].content, /one complete paragraph/);
+
+  const lunaRoute = routeForModel('gpt-5.6-luna');
+  const lunaBody = forwardedChatBody({
+    ...request,
+    model: 'gpt-5.6-luna',
+    reasoning_effort: 'minimal',
+  }, lunaRoute);
+  assert.equal(lunaBody.reasoning_effort, 'none');
+  assert.equal(lunaBody.verbosity, 'medium');
+  assert.match(lunaBody.messages[0].content, /complete visible birth opening/);
+  assert.equal(gpt5MiniBirthResponseNeedsRetry({
+    choices: [{ message: { content: '' }, finish_reason: 'length' }],
+  }, lunaBody), true);
+
+  const lunaRetry = gpt5MiniBirthRetryBody(lunaBody, lunaRoute);
+  assert.equal(lunaRetry.max_completion_tokens, 1000);
+  assert.equal(lunaRetry.reasoning_effort, 'none');
+  assert.equal(lunaRetry.verbosity, 'medium');
+  assert.notEqual(lunaRetry.reasoning_effort, 'minimal');
+  assert.match(lunaRetry.messages[0].content, /complete visible birth opening/);
+});
+
+test('keeps GPT-5 mini annual Age cache keys and recovers an empty visible passage', () => {
+  const request = {
+    model: 'gpt-5-mini',
+    messages: [
+      {
+        role: 'system',
+        content: 'TASK: Write only the new visible passage after an Age press.\nCache contract: gpt5-mini-annual-age-cache-v1.',
+      },
+      {
+        role: 'user',
+        content: 'Player: Avery Morgan; age 4 advancing to age 5.',
+      },
+    ],
+    max_tokens: 700,
+    prompt_cache_key: 'my-path-gpt5-fast-cache-v2',
+  };
+  const route = routeForModel('gpt-5-mini');
+  const body = forwardedChatBody(request, route);
+
+  assert.equal(isGPT5MiniAnnualAgeRequest(body), true);
+  assert.equal(body.prompt_cache_key, 'my-path-gpt5-fast-cache-v2');
+  assert.equal(body.max_completion_tokens, 700);
+  assert.equal(body.reasoning_effort, 'minimal');
+  assert.equal(body.verbosity, 'low');
+  assert.equal(gpt5MiniAnnualAgeResponseNeedsRetry({
+    choices: [{ message: { content: '' }, finish_reason: 'length' }],
+  }, body), true);
+  assert.equal(gpt5MiniAnnualAgeResponseNeedsRetry({
+    choices: [{ message: { content: 'You race across the playground and reach the ball first.' }, finish_reason: 'stop' }],
+  }, body), false);
+
+  const retry = gpt5MiniAnnualAgeRetryBody(body, route);
+  assert.equal(retry.max_completion_tokens, 900);
   assert.equal(retry.reasoning_effort, 'minimal');
   assert.equal(retry.verbosity, 'low');
-  assert.match(retry.messages[0].content, /4-6 complete sentences/);
-  assert.match(retry.messages[0].content, /no more than 160 words/);
+  assert.match(retry.messages[0].content, /complete non-empty visible Age passage/);
+  assert.equal(isGPT5MiniAnnualAgeRequest({
+    ...body,
+    prompt_cache_key: 'some-other-request',
+  }), false);
+});
+
+test('sums cached prompt details when a provider recovery request is needed', () => {
+  const usage = mergedUsage(
+    {
+      prompt_tokens: 2_400,
+      completion_tokens: 300,
+      total_tokens: 2_700,
+      prompt_tokens_details: { cached_tokens: 2_048, cache_write_tokens: 0 },
+    },
+    {
+      prompt_tokens: 2_500,
+      completion_tokens: 220,
+      total_tokens: 2_720,
+      prompt_tokens_details: { cached_tokens: 2_048, cache_write_tokens: 0 },
+    },
+  );
+
+  assert.equal(usage.prompt_tokens, 4_900);
+  assert.equal(usage.completion_tokens, 520);
+  assert.equal(usage.total_tokens, 5_420);
+  assert.equal(usage.prompt_tokens_details.cached_tokens, 4_096);
+  assert.equal(usage.prompt_tokens_details.cache_write_tokens, 0);
 });
 
 test('accepts only canonical player UUIDs and signs receipts for that player and UTC day', () => {
@@ -466,6 +607,23 @@ test('reserves conservatively but reconciles against actual provider usage', () 
       { ...body, model: 'deepseek-v4-pro', response_format: { type: 'json_object' } },
       routeForModel('deepseek-v4-pro'),
       new Date('2026-08-01T12:00:00Z'),
+    ),
+    (serializedBytes + 750) * 2,
+  );
+  assert.equal(
+    estimatedChatWalletTokens(
+      {
+        ...body,
+        model: 'gpt-5.6-luna',
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'gpt5_birth_narration',
+            schema: { properties: { narration: { type: 'string' } } },
+          },
+        },
+      },
+      routeForModel('gpt-5.6-luna'),
     ),
     (serializedBytes + 750) * 2,
   );
