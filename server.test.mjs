@@ -26,6 +26,7 @@ import {
   issueAppAttestChallenges,
   isGPT5MiniAnnualAgeRequest,
   isGPT5MiniBirthNarrationRequest,
+  isGPT5MiniCustomBirthDossierRequest,
   mergedUsage,
   normalizeAIContentReport,
   normalizeModelName,
@@ -345,6 +346,19 @@ test('recognizes only GPT-5 mini birth narration requests for empty-output recov
     messages: birthMessages,
     response_format: narrationSchema,
   }), true);
+  for (const name of [
+    'gpt5_standard_birth_launch_v2',
+    'gpt5_standard_birth_launch_v3',
+    'gpt5_standard_birth_launch_v4',
+  ]) {
+    assert.equal(isGPT5MiniBirthNarrationRequest({
+      model: 'gpt-5-mini',
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name, schema: { type: 'object' } },
+      },
+    }), true);
+  }
   assert.equal(isGPT5MiniBirthNarrationRequest({
     messages: [
       {
@@ -374,6 +388,30 @@ test('recognizes only GPT-5 mini birth narration requests for empty-output recov
   }), false);
 });
 
+test('recognizes the compact GPT-5 custom birth launch schema', () => {
+  const request = {
+    model: 'gpt-5-mini',
+    messages: [{ role: 'system', content: 'Simulate a custom life.' }],
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'gpt5_custom_birth_launch_v2', schema: { type: 'object' } },
+    },
+  };
+  assert.equal(isGPT5MiniCustomBirthDossierRequest(request), true);
+  assert.equal(isGPT5MiniCustomBirthDossierRequest({
+    ...request,
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'gpt5_custom_birth_launch_v3', schema: { type: 'object' } },
+    },
+  }), true);
+  assert.equal(
+    forwardedChatBody(request, routeForModel('gpt-5-mini')).verbosity,
+    'low',
+  );
+  assert.equal(isGPT5MiniBirthNarrationRequest(request), false);
+});
+
 test('retries empty length-limited GPT-5 births with model-compatible effort and full budget', () => {
   const request = {
     messages: [
@@ -388,7 +426,7 @@ test('retries empty length-limited GPT-5 births with model-compatible effort and
   const miniRoute = routeForModel('gpt-5-mini');
   const body = forwardedChatBody({ ...request, model: 'gpt-5-mini' }, miniRoute);
 
-  assert.equal(body.verbosity, 'medium');
+  assert.equal(body.verbosity, 'low');
   assert.match(body.messages[0].content, /complete visible birth opening/);
   assert.match(body.messages[0].content, /paragraph rhythm/);
   assert.doesNotMatch(body.messages[0].content, /one complete paragraph/);
@@ -404,9 +442,9 @@ test('retries empty length-limited GPT-5 births with model-compatible effort and
   }, body), false);
 
   const retry = gpt5MiniBirthRetryBody(body, miniRoute);
-  assert.equal(retry.max_completion_tokens, 1000);
+  assert.equal(retry.max_completion_tokens, 900);
   assert.equal(retry.reasoning_effort, 'minimal');
-  assert.equal(retry.verbosity, 'medium');
+  assert.equal(retry.verbosity, 'low');
   assert.match(retry.messages[0].content, /complete visible birth opening/);
   assert.match(retry.messages[0].content, /paragraph rhythm/);
   assert.doesNotMatch(retry.messages[0].content, /one complete paragraph/);
@@ -418,16 +456,16 @@ test('retries empty length-limited GPT-5 births with model-compatible effort and
     reasoning_effort: 'minimal',
   }, lunaRoute);
   assert.equal(lunaBody.reasoning_effort, 'none');
-  assert.equal(lunaBody.verbosity, 'medium');
+  assert.equal(lunaBody.verbosity, 'low');
   assert.match(lunaBody.messages[0].content, /complete visible birth opening/);
   assert.equal(gpt5MiniBirthResponseNeedsRetry({
     choices: [{ message: { content: '' }, finish_reason: 'length' }],
   }, lunaBody), true);
 
   const lunaRetry = gpt5MiniBirthRetryBody(lunaBody, lunaRoute);
-  assert.equal(lunaRetry.max_completion_tokens, 1000);
+  assert.equal(lunaRetry.max_completion_tokens, 900);
   assert.equal(lunaRetry.reasoning_effort, 'none');
-  assert.equal(lunaRetry.verbosity, 'medium');
+  assert.equal(lunaRetry.verbosity, 'low');
   assert.notEqual(lunaRetry.reasoning_effort, 'minimal');
   assert.match(lunaRetry.messages[0].content, /complete visible birth opening/);
 });
@@ -438,7 +476,7 @@ test('keeps GPT-5 mini annual Age cache keys and recovers an empty visible passa
     messages: [
       {
         role: 'system',
-        content: 'TASK: Write only the new visible passage after an Age press.\nCache contract: gpt5-mini-annual-age-cache-v1.',
+        content: 'TASK: Write only the new visible passage after an Age press.\nCache contract: gpt5-mini-annual-age-cache-v2.',
       },
       {
         role: 'user',
@@ -472,6 +510,13 @@ test('keeps GPT-5 mini annual Age cache keys and recovers an empty visible passa
     ...body,
     prompt_cache_key: 'some-other-request',
   }), false);
+  assert.equal(isGPT5MiniAnnualAgeRequest({
+    ...body,
+    messages: [{
+      role: 'system',
+      content: 'TASK: Write only the new visible passage after an Age press.\nCache contract: gpt5-mini-annual-age-cache-v1.',
+    }],
+  }), true);
 });
 
 test('sums cached prompt details when a provider recovery request is needed', () => {

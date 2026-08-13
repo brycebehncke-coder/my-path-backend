@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-age-cache-recovery-v1';
+const backendRevision = 'gpt5-mini-age-continuity-v2';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
@@ -92,7 +92,7 @@ const aiContentReportMaximumPerPlayerPerDay = configuredPositiveInteger(
 const aiContentReportCountsByPlayerDay = new Map();
 const aiContentReportAggregateCounts = new Map();
 const aiContentReportCategories = new Set(['offensive_or_inappropriate']);
-const gpt5MiniBirthNarrationTokenBudget = 1000;
+const gpt5MiniBirthNarrationTokenBudget = 900;
 const gpt5MiniBirthNarrationInstruction = 'Return the complete visible birth opening immediately. Preserve every supplied fact and follow the requested prose length, paragraph rhythm, voice, and response format exactly.';
 const gpt5MiniAnnualAgeTokenBudget = 900;
 const gpt5MiniAnnualAgeInstruction = 'Return a complete non-empty visible Age passage now. Use the supplied life state, finish every sentence, and return prose only.';
@@ -984,6 +984,14 @@ async function verifyPlayIntegrityRequest({
 }
 
 async function verifyGenuineAppRequest(args) {
+  const permitsLocalAIEvaluation = port === 39005
+    && process.env.NODE_ENV !== 'production'
+    && process.env.MY_PATH_LOCAL_AI_EVAL_BYPASS_APP_ATTEST === '1'
+    && requestHeader(args.req, 'x-my-path-player-id')
+      === '00000000-0000-4000-8000-000000000001';
+  if (permitsLocalAIEvaluation) {
+    return { verified: false, platform: 'ios', debug: true };
+  }
   const platform = requestHeader(args.req, 'x-my-path-platform').toLowerCase();
   if (platform === 'android') {
     return verifyPlayIntegrityRequest(args);
@@ -1373,11 +1381,13 @@ function forwardedChatBody(body, route) {
       forwarded.reasoning_effort,
     );
     if (isGPT5MiniBirthNarrationRequest(forwarded)) {
-      forwarded.verbosity = 'medium';
+      forwarded.verbosity = 'low';
       forwarded.messages = appendSystemInstruction(
         forwarded.messages,
         gpt5MiniBirthNarrationInstruction,
       );
+    } else if (isGPT5MiniCustomBirthDossierRequest(forwarded)) {
+      forwarded.verbosity = 'low';
     } else if (isGPT5MiniAnnualAgeRequest(forwarded)) {
       forwarded.verbosity = 'low';
     }
@@ -1438,8 +1448,19 @@ function deepSeekResponseNeedsRetry(payload, forwardedBody) {
 }
 
 function isGPT5MiniBirthNarrationRequest(body) {
+  const promptCacheKey = String(body?.prompt_cache_key || '').trim();
+  if (promptCacheKey === 'my-path-gpt5-birth-narration-plain-v1') {
+    return true;
+  }
   const responseFormat = body?.response_format;
   const schemaName = String(responseFormat?.json_schema?.name || '').trim();
+  if (
+    schemaName === 'gpt5_standard_birth_launch_v2'
+    || schemaName === 'gpt5_standard_birth_launch_v3'
+    || schemaName === 'gpt5_standard_birth_launch_v4'
+  ) {
+    return true;
+  }
   const properties = responseFormat?.json_schema?.schema?.properties;
   const hasNarrationOnlySchema = properties
     && typeof properties === 'object'
@@ -1472,6 +1493,12 @@ function isGPT5MiniBirthNarrationRequest(body) {
   return Boolean(hasNarrationOnlySchema);
 }
 
+function isGPT5MiniCustomBirthDossierRequest(body) {
+  const schemaName = String(body?.response_format?.json_schema?.name || '').trim();
+  return schemaName === 'gpt5_custom_birth_launch_v2'
+    || schemaName === 'gpt5_custom_birth_launch_v3';
+}
+
 function gpt5MiniBirthResponseNeedsRetry(payload, forwardedBody) {
   if (!isGPT5MiniBirthNarrationRequest(forwardedBody)) {
     return false;
@@ -1489,7 +1516,7 @@ function gpt5MiniBirthRetryBody(forwardedBody, route = routeForModel(forwardedBo
       gpt5MiniBirthNarrationTokenBudget,
     ),
     reasoning_effort: compatibleOpenAIReasoningEffort(route, forwardedBody?.reasoning_effort),
-    verbosity: 'medium',
+    verbosity: 'low',
     messages: appendSystemInstruction(
       forwardedBody.messages,
       `The prior generation used its entire limit without returning visible text. ${gpt5MiniBirthNarrationInstruction}`,
@@ -1507,7 +1534,7 @@ function isGPT5MiniAnnualAgeRequest(body) {
     .filter((message) => message?.role === 'system')
     .map((message) => String(message?.content || ''))
     .join('\n');
-  return systemText.includes('gpt5-mini-annual-age-cache-v1')
+  return /gpt5-mini-annual-age-cache-v\d+\b/.test(systemText)
     && systemText.includes('Write only the new visible passage after an Age press');
 }
 
@@ -1575,7 +1602,45 @@ function mergedUsage(firstUsage, secondUsage) {
 
 async function proxyChatCompletion(body, route) {
   const forwarded = forwardedChatBody(body, route);
+  const birthRequest = isGPT5MiniBirthNarrationRequest(forwarded);
+  const customBirthRequest = isGPT5MiniCustomBirthDossierRequest(forwarded);
+  const requestStartedAt = Date.now();
   const first = await performChatCompletion(forwarded, route);
+  if (birthRequest && port === 39005) {
+    const content = first.payload?.choices?.[0]?.message?.content;
+    console.info('GPT5_BIRTH_UPSTREAM', {
+      attempt: 1,
+      elapsed_ms: Date.now() - requestStartedAt,
+      ok: first.ok,
+      finish_reason: first.payload?.choices?.[0]?.finish_reason || null,
+      visible_characters: typeof content === 'string' ? content.trim().length : 0,
+      completion_tokens: Number(first.payload?.usage?.completion_tokens || 0),
+    });
+  }
+  if (customBirthRequest && port === 39005) {
+    const content = first.payload?.choices?.[0]?.message?.content;
+    console.info('GPT5_CUSTOM_BIRTH_UPSTREAM', {
+      elapsed_ms: Date.now() - requestStartedAt,
+      ok: first.ok,
+      finish_reason: first.payload?.choices?.[0]?.finish_reason || null,
+      visible_characters: typeof content === 'string' ? content.trim().length : 0,
+      prompt_tokens: Number(first.payload?.usage?.prompt_tokens || 0),
+      completion_tokens: Number(first.payload?.usage?.completion_tokens || 0),
+      cached_tokens: Number(first.payload?.usage?.prompt_tokens_details?.cached_tokens || 0),
+    });
+  }
+  if (port === 39005 && route.provider === 'OpenAI' && !birthRequest && !customBirthRequest) {
+    const content = first.payload?.choices?.[0]?.message?.content;
+    console.info('LOCAL_OPENAI_UPSTREAM', {
+      elapsed_ms: Date.now() - requestStartedAt,
+      ok: first.ok,
+      finish_reason: first.payload?.choices?.[0]?.finish_reason || null,
+      visible_characters: typeof content === 'string' ? content.trim().length : 0,
+      prompt_tokens: Number(first.payload?.usage?.prompt_tokens || 0),
+      completion_tokens: Number(first.payload?.usage?.completion_tokens || 0),
+      cached_tokens: Number(first.payload?.usage?.prompt_tokens_details?.cached_tokens || 0),
+    });
+  }
   if (!first.ok) {
     return first;
   }
@@ -1603,7 +1668,20 @@ async function proxyChatCompletion(body, route) {
     return first;
   }
 
+  const retryStartedAt = Date.now();
   const second = await performChatCompletion(retryBody, route);
+  if (birthRequest && port === 39005) {
+    const content = second.payload?.choices?.[0]?.message?.content;
+    console.info('GPT5_BIRTH_UPSTREAM', {
+      attempt: 2,
+      elapsed_ms: Date.now() - retryStartedAt,
+      total_elapsed_ms: Date.now() - requestStartedAt,
+      ok: second.ok,
+      finish_reason: second.payload?.choices?.[0]?.finish_reason || null,
+      visible_characters: typeof content === 'string' ? content.trim().length : 0,
+      completion_tokens: Number(second.payload?.usage?.completion_tokens || 0),
+    });
+  }
   if (second.payload && typeof second.payload === 'object') {
     second.payload.usage = mergedUsage(first.payload?.usage, second.payload.usage);
   }
@@ -1980,6 +2058,14 @@ const server = createServer(async (req, res) => {
         });
       }
 
+      if (port === 39005) {
+        console.info('LOCAL_CHAT_REQUEST', {
+          model: body.model,
+          schema: body?.response_format?.json_schema?.name || null,
+          max_tokens: body.max_completion_tokens ?? body.max_tokens ?? null,
+        });
+      }
+
       const route = routeForModel(body.model);
       const quotaAt = new Date();
       const quotaDay = playerQuotaUTCDateKey(quotaAt);
@@ -2099,6 +2185,7 @@ export {
   gpt5MiniAnnualAgeRetryBody,
   isGPT5MiniAnnualAgeRequest,
   isGPT5MiniBirthNarrationRequest,
+  isGPT5MiniCustomBirthDossierRequest,
   forwardedChatBody,
   mergedUsage,
   normalizeAIContentReport,
