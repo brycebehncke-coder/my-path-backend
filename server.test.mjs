@@ -502,10 +502,15 @@ test('keeps GPT-5 mini annual Age cache keys and recovers an empty visible passa
   }, body), false);
 
   const retry = gpt5MiniAnnualAgeRetryBody(body, route);
-  assert.equal(retry.max_completion_tokens, 900);
+  assert.equal(retry.max_completion_tokens, 700);
   assert.equal(retry.reasoning_effort, 'minimal');
   assert.equal(retry.verbosity, 'low');
   assert.match(retry.messages[0].content, /complete non-empty visible Age passage/);
+  assert.match(retry.messages[0].content, /do not narrate the time jump/);
+  assert.equal(gpt5MiniAnnualAgeRetryBody({
+    ...body,
+    max_completion_tokens: 500,
+  }, route).max_completion_tokens, 500);
   assert.equal(isGPT5MiniAnnualAgeRequest({
     ...body,
     prompt_cache_key: 'some-other-request',
@@ -671,6 +676,23 @@ test('reserves conservatively but reconciles against actual provider usage', () 
       routeForModel('gpt-5.6-luna'),
     ),
     (serializedBytes + 750) * 2,
+  );
+  const annualAgeMessages = [{
+    role: 'system',
+    content: 'TASK: Write only the new visible passage after an Age press.\nCache contract: gpt5-mini-annual-age-cache-v2.',
+  }];
+  const annualAgeBytes = Buffer.byteLength(JSON.stringify(annualAgeMessages), 'utf8');
+  assert.equal(
+    estimatedChatWalletTokens(
+      {
+        model: 'gpt-5-mini',
+        messages: annualAgeMessages,
+        max_tokens: 500,
+        prompt_cache_key: 'my-path-gpt5-fast-cache-v2',
+      },
+      routeForModel('gpt-5-mini'),
+    ),
+    (annualAgeBytes + 500) * 2,
   );
 
   const deepSeekUsage = { usage: { prompt_tokens: 800, completion_tokens: 200 } };

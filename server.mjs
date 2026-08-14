@@ -95,7 +95,7 @@ const aiContentReportCategories = new Set(['offensive_or_inappropriate']);
 const gpt5MiniBirthNarrationTokenBudget = 900;
 const gpt5MiniBirthNarrationInstruction = 'Return the complete visible birth opening immediately. Preserve every supplied fact and follow the requested prose length, paragraph rhythm, voice, and response format exactly.';
 const gpt5MiniAnnualAgeTokenBudget = 900;
-const gpt5MiniAnnualAgeInstruction = 'Return a complete non-empty visible Age passage now. Use the supplied life state, finish every sentence, and return prose only.';
+const gpt5MiniAnnualAgeInstruction = 'Return a complete non-empty visible Age passage now. Begin directly inside the fresh event; do not narrate the time jump, age number, growing older, or growing taller. Use the supplied life state, finish every sentence, and return prose only.';
 
 const creatorCodeRewardTypes = new Set([
   'ai_tokens',
@@ -1049,7 +1049,9 @@ function estimatedChatWalletTokens(body, route, at = new Date()) {
   const possibleAttempts = (
     route.kind === 'deepseek' && body?.response_format?.type === 'json_object'
   ) || (
-    isOpenAIReasoningRoute(route) && isGPT5MiniBirthNarrationRequest(body)
+    isOpenAIReasoningRoute(route) && (
+      isGPT5MiniBirthNarrationRequest(body) || isGPT5MiniAnnualAgeRequest(body)
+    )
   ) ? 2 : 1;
   const pricingMultiplier = route.kind === 'deepseek' ? deepSeekPricingMultiplier(at) : 1;
   return (promptEstimate + requestedCompletion) * possibleAttempts * pricingMultiplier;
@@ -1549,9 +1551,11 @@ function gpt5MiniAnnualAgeResponseNeedsRetry(payload, forwardedBody) {
 function gpt5MiniAnnualAgeRetryBody(forwardedBody, route = routeForModel(forwardedBody?.model)) {
   return {
     ...forwardedBody,
-    max_completion_tokens: Math.max(
-      Number(forwardedBody?.max_completion_tokens) || 0,
+    max_completion_tokens: configuredPositiveInteger(
+      forwardedBody?.max_completion_tokens,
       gpt5MiniAnnualAgeTokenBudget,
+      1,
+      100_000,
     ),
     reasoning_effort: compatibleOpenAIReasoningEffort(route, forwardedBody?.reasoning_effort),
     verbosity: 'low',
