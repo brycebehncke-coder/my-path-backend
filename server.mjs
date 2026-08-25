@@ -1345,7 +1345,9 @@ function portraitEstimatedCostUSD(operation) {
 
 function portraitGenerationPrompt(subject) {
   const facts = [
-    `${subject.lifeStage} ${subject.species}`,
+    `exact chronological age: ${subject.age} years old`,
+    `life stage: ${subject.lifeStage}`,
+    `exact species or breed: ${subject.species}`,
     subject.gender && `gender: ${subject.gender}`,
     subject.role && `role in the life: ${subject.role}`,
     subject.location && `from ${subject.location}`,
@@ -1354,11 +1356,12 @@ function portraitGenerationPrompt(subject) {
     subject.subjectDescription && `life-specific details: ${subject.subjectDescription}`,
   ].filter(Boolean).join('. ');
   return [
-    'Create one grounded, naturalistic, photographically realistic portrait of the exact subject described below.',
+    'Create one polished, simplified life-simulation portrait of the exact subject described below.',
     facts,
-    'Render realistic anatomy, proportions, materials, lighting, and surface texture. The app applies its own subtle pixel treatment afterward, so do not draw pixel art, cartoon art, game art, mascot art, chibi art, or an illustration.',
+    'Use believable anatomy and proportions with softly simplified shapes, restrained detail, clean color, and gentle texture. It should look like premium low-detail character art, not a photograph and not an exaggerated cartoon, mascot, anime, or chibi character. The app applies its own subtle pixel treatment afterward, so do not draw pixel art.',
     'Show exactly one subject, centered and facing forward, with its head and natural upper body framing visible against a plain unobtrusive background.',
-    'Make the age, exact species or breed, clothing when appropriate, culture, and historical era coherent. Treat any real-world animal species or breed found in the facts as binding.',
+    'The exact chronological age is binding. Make the subject unmistakably look that age, not merely the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly. Do not add wrinkles, gray hair, sagging features, or other older-age cues unless the exact age or supplied appearance requires them. Babies, children, and teenagers must never look like adults.',
+    'Make the exact species or breed, clothing when appropriate, culture, and historical era coherent. Treat any real-world animal species or breed found in the facts as binding, and interpret an animal age using that species or breed\'s natural lifespan rather than human aging cues.',
     'If the subject is an animal, portray a normal real animal of that exact species or breed with its natural skull, muzzle or beak, eyes, ears, paws or hooves, limbs, posture, fur, feathers, scales, or skin. A four-legged animal remains quadrupedal. Never add a human face, skin, hair, hands, shoulders, torso, upright human posture, clothing, or human-animal hybrid anatomy. Never anthropomorphize it unless the life facts explicitly require an anthropomorphic character.',
     'If the subject is human, humanoid, alien, or fantastical, keep its anatomy coherent and grounded while following the stated species exactly. Use a calm natural expression, not an exaggerated character expression. No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
   ].join(' ');
@@ -1370,10 +1373,11 @@ function portraitEditPrompt(subject, requestedChange) {
   return [
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
-    `The subject remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
-    'Preserve identity, facial structure, age, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
+    `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
+    'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
+    'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, softly simplified low-detail texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
-    'Do not turn the image into pixel art, cartoon art, game art, mascot art, chibi art, or an illustration. The app applies subtle pixelation after editing.',
+    'Keep the polished simplified life-simulation art direction. Do not turn the image into a photograph, exaggerated cartoon, mascot, anime, chibi art, or pixel art. The app applies subtle pixelation after editing.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].join(' ');
 }

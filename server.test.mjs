@@ -94,14 +94,14 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
   assert.match(prompt, /exactly one subject/i);
-  assert.match(prompt, /grounded, naturalistic, photographically realistic portrait/i);
+  assert.match(prompt, /polished, simplified life-simulation portrait/i);
+  assert.match(prompt, /exact chronological age: 9 years old/i);
+  assert.match(prompt, /not a photograph/i);
   assert.match(prompt, /exact species or breed/i);
   assert.match(prompt, /normal real animal/i);
   assert.match(prompt, /never add a human face/i);
   assert.match(prompt, /never anthropomorphize/i);
-  assert.match(prompt, /do not draw pixel art, cartoon art, game art/i);
-  assert.doesNotMatch(prompt, /2D game art/i);
-  assert.doesNotMatch(prompt, /not photorealistic/i);
+  assert.match(prompt, /do not draw pixel art/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
@@ -124,10 +124,13 @@ test('portrait editing applies only the requested appearance change to image zer
   assert.match(prompt, /image 0/i);
   assert.match(prompt, /short blue hair/i);
   assert.match(prompt, /same character/i);
+  assert.match(prompt, /exact chronological age of 24 years old/i);
+  assert.match(prompt, /twenties must look like a young adult/i);
   assert.match(prompt, /exact species or breed/i);
   assert.match(prompt, /normal animal anatomy/i);
   assert.match(prompt, /never add human facial structure/i);
   assert.match(prompt, /app applies subtle pixelation/i);
+  assert.match(prompt, /simplified life-simulation art direction/i);
   assert.doesNotMatch(prompt, /mildly pixelated low-resolution art style/i);
   assert.throws(() => portraitEditPrompt(subject, '   '), /appearance change/i);
 });
