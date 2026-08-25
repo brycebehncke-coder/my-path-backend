@@ -94,9 +94,14 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
   assert.match(prompt, /exactly one subject/i);
-  assert.match(prompt, /mildly pixelated/i);
-  assert.match(prompt, /natural anatomy/i);
-  assert.match(prompt, /not.*super-cartoony/i);
+  assert.match(prompt, /grounded, naturalistic, photographically realistic portrait/i);
+  assert.match(prompt, /exact species or breed/i);
+  assert.match(prompt, /normal real animal/i);
+  assert.match(prompt, /never add a human face/i);
+  assert.match(prompt, /never anthropomorphize/i);
+  assert.match(prompt, /do not draw pixel art, cartoon art, game art/i);
+  assert.doesNotMatch(prompt, /2D game art/i);
+  assert.doesNotMatch(prompt, /not photorealistic/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
@@ -119,8 +124,11 @@ test('portrait editing applies only the requested appearance change to image zer
   assert.match(prompt, /image 0/i);
   assert.match(prompt, /short blue hair/i);
   assert.match(prompt, /same character/i);
-  assert.match(prompt, /mildly pixelated/i);
-  assert.match(prompt, /natural species anatomy/i);
+  assert.match(prompt, /exact species or breed/i);
+  assert.match(prompt, /normal animal anatomy/i);
+  assert.match(prompt, /never add human facial structure/i);
+  assert.match(prompt, /app applies subtle pixelation/i);
+  assert.doesNotMatch(prompt, /mildly pixelated low-resolution art style/i);
   assert.throws(() => portraitEditPrompt(subject, '   '), /appearance change/i);
 });
 

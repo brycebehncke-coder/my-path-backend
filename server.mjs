@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v2';
+const backendRevision = 'generated-character-portraits-v3-natural-realism';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1354,12 +1354,13 @@ function portraitGenerationPrompt(subject) {
     subject.subjectDescription && `life-specific details: ${subject.subjectDescription}`,
   ].filter(Boolean).join('. ');
   return [
-    'Create one complete character portrait for a life-simulation mobile game.',
+    'Create one grounded, naturalistic, photographically realistic portrait of the exact subject described below.',
     facts,
-    'Use mildly pixelated low-resolution 2D game art with readable small pixel blocks, clean shapes, restrained detail, and gentle shading. Keep it polished and recognizable, not chunky 8-bit art and not photorealistic.',
-    'Show exactly one subject, centered and facing forward, head and shoulders visible, with a plain unobtrusive background.',
-    'Make the age, exact species, clothing, culture, and historical era coherent. Animals must have recognizable natural anatomy, proportions, fur, feathers, scales, or skin for their species. Do not humanize an animal, give it a human face or body, dress it in human clothing, or make it a mascot unless the life facts explicitly say it is anthropomorphic.',
-    'Use a restrained life-sim portrait style rather than an exaggerated or super-cartoony expression. No words, labels, logos, borders, UI, extra people, or duplicate body parts.',
+    'Render realistic anatomy, proportions, materials, lighting, and surface texture. The app applies its own subtle pixel treatment afterward, so do not draw pixel art, cartoon art, game art, mascot art, chibi art, or an illustration.',
+    'Show exactly one subject, centered and facing forward, with its head and natural upper body framing visible against a plain unobtrusive background.',
+    'Make the age, exact species or breed, clothing when appropriate, culture, and historical era coherent. Treat any real-world animal species or breed found in the facts as binding.',
+    'If the subject is an animal, portray a normal real animal of that exact species or breed with its natural skull, muzzle or beak, eyes, ears, paws or hooves, limbs, posture, fur, feathers, scales, or skin. A four-legged animal remains quadrupedal. Never add a human face, skin, hair, hands, shoulders, torso, upright human posture, clothing, or human-animal hybrid anatomy. Never anthropomorphize it unless the life facts explicitly require an anthropomorphic character.',
+    'If the subject is human, humanoid, alien, or fantastical, keep its anatomy coherent and grounded while following the stated species exactly. Use a calm natural expression, not an exaggerated character expression. No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
   ].join(' ');
 }
 
@@ -1370,8 +1371,9 @@ function portraitEditPrompt(subject, requestedChange) {
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
     `The subject remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
-    'Preserve identity, facial structure, age, exact species, natural anatomy, pose, crop, proportions, mildly pixelated low-resolution art style, lighting, clothing unless requested, and background.',
-    'For animals, preserve recognizable natural species anatomy and avoid human or mascot features unless the existing image and life facts are explicitly anthropomorphic.',
+    'Preserve identity, facial structure, age, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
+    'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
+    'Do not turn the image into pixel art, cartoon art, game art, mascot art, chibi art, or an illustration. The app applies subtle pixelation after editing.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].join(' ');
 }
