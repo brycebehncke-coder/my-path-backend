@@ -73,6 +73,27 @@ test('portrait generation body uses only fields accepted by the Cloudflare REST 
   assert.equal('seed' in body, false);
 });
 
+test('portrait generation prompts stay within the Cloudflare 2048-character contract', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'maximum-sized-portrait-subject',
+    name: 'N'.repeat(100),
+    gender: 'G'.repeat(60),
+    age: 29,
+    role: 'R'.repeat(80),
+    species: 'S'.repeat(100),
+    location: 'L'.repeat(160),
+    era: 'E'.repeat(80),
+    appearance_description: 'A'.repeat(320),
+    subject_description: 'D'.repeat(500),
+  });
+  const prompt = portraitGenerationPrompt(subject);
+  assert.ok(prompt.length <= 2_000, `prompt was ${prompt.length} characters`);
+  assert.match(prompt, /exact chronological age: 29 years old/i);
+  assert.match(prompt, /people in their twenties look young/i);
+  assert.match(prompt, /quadrupeds stay quadrupedal/i);
+  assert.match(prompt, /no words, labels, logos/i);
+});
+
 test('portrait subjects preserve unusual custom-life species without accepting prompt-sized fields', () => {
   const subject = normalizePortraitSubject({
     profile_id: 'profile-123',
@@ -94,14 +115,14 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
   assert.match(prompt, /exactly one subject/i);
-  assert.match(prompt, /polished, simplified life-simulation portrait/i);
+  assert.match(prompt, /polished simplified life-simulation portrait/i);
   assert.match(prompt, /exact chronological age: 9 years old/i);
   assert.match(prompt, /not a photograph/i);
   assert.match(prompt, /exact species or breed/i);
-  assert.match(prompt, /normal real animal/i);
-  assert.match(prompt, /never add a human face/i);
-  assert.match(prompt, /never anthropomorphize/i);
-  assert.match(prompt, /do not draw pixel art/i);
+  assert.match(prompt, /real animals keep normal breed anatomy/i);
+  assert.match(prompt, /never give animals human faces/i);
+  assert.match(prompt, /anthropomorphism unless explicitly requested/i);
+  assert.match(prompt, /not a photograph, pixel art/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,

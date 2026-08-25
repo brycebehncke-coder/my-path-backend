@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v3-natural-realism';
+const backendRevision = 'generated-character-portraits-v4-provider-limit-safe';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1287,6 +1287,7 @@ function recordCreatorCodeFailure(address, at = Date.now()) {
 }
 
 const portraitLifeStages = ['baby', 'child', 'teen', 'adult', 'elderly'];
+const portraitGenerationPromptMaximumLength = 2_000;
 
 function portraitSafeText(value, maximumLength = 180) {
   return String(value ?? '')
@@ -1345,26 +1346,24 @@ function portraitEstimatedCostUSD(operation) {
 
 function portraitGenerationPrompt(subject) {
   const facts = [
-    `exact chronological age: ${subject.age} years old`,
-    `life stage: ${subject.lifeStage}`,
-    `exact species or breed: ${subject.species}`,
-    subject.gender && `gender: ${subject.gender}`,
-    subject.role && `role in the life: ${subject.role}`,
-    subject.location && `from ${subject.location}`,
-    subject.era && `living in ${subject.era}`,
-    subject.appearanceDescription && `appearance: ${subject.appearanceDescription}`,
-    subject.subjectDescription && `life-specific details: ${subject.subjectDescription}`,
-  ].filter(Boolean).join('. ');
-  return [
-    'Create one polished, simplified life-simulation portrait of the exact subject described below.',
+    `exact chronological age: ${subject.age} years old (${subject.lifeStage})`,
+    `exact species or breed: ${portraitSafeText(subject.species, 60)}`,
+    subject.gender && `gender: ${portraitSafeText(subject.gender, 24)}`,
+    subject.role && `role: ${portraitSafeText(subject.role, 40)}`,
+    subject.location && `place: ${portraitSafeText(subject.location, 80)}`,
+    subject.era && `era: ${portraitSafeText(subject.era, 48)}`,
+    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 140)}`,
+    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 180)}`,
+  ].filter(Boolean).join('; ');
+  const prompt = [
+    'Create one polished simplified life-simulation portrait, not a photograph, pixel art, anime, chibi, mascot, or exaggerated cartoon.',
     facts,
-    'Use believable anatomy and proportions with softly simplified shapes, restrained detail, clean color, and gentle texture. It should look like premium low-detail character art, not a photograph and not an exaggerated cartoon, mascot, anime, or chibi character. The app applies its own subtle pixel treatment afterward, so do not draw pixel art.',
-    'Show exactly one subject, centered and facing forward, with its head and natural upper body framing visible against a plain unobtrusive background.',
-    'The exact chronological age is binding. Make the subject unmistakably look that age, not merely the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly. Do not add wrinkles, gray hair, sagging features, or other older-age cues unless the exact age or supplied appearance requires them. Babies, children, and teenagers must never look like adults.',
-    'Make the exact species or breed, clothing when appropriate, culture, and historical era coherent. Treat any real-world animal species or breed found in the facts as binding, and interpret an animal age using that species or breed\'s natural lifespan rather than human aging cues.',
-    'If the subject is an animal, portray a normal real animal of that exact species or breed with its natural skull, muzzle or beak, eyes, ears, paws or hooves, limbs, posture, fur, feathers, scales, or skin. A four-legged animal remains quadrupedal. Never add a human face, skin, hair, hands, shoulders, torso, upright human posture, clothing, or human-animal hybrid anatomy. Never anthropomorphize it unless the life facts explicitly require an anthropomorphic character.',
-    'If the subject is human, humanoid, alien, or fantastical, keep its anatomy coherent and grounded while following the stated species exactly. Use a calm natural expression, not an exaggerated character expression. No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
+    'Show exactly one subject, centered and forward-facing, with a natural head-and-upper-body crop, plain background, restrained detail, clean color, and gentle texture.',
+    'The exact age is binding. Make the subject unmistakably that age. People in their twenties look young; add no wrinkles, gray hair, sagging, or elderly features unless age or appearance requires them. Babies, children, and teens never look adult.',
+    'Respect the exact species or breed, culture, clothing, and era. Interpret animal age by that species lifespan. Real animals keep normal breed anatomy and natural skull, muzzle or beak, eyes, ears, limbs, paws or hooves, fur, feathers, scales, and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
+    'Keep human, humanoid, alien, and fantasy anatomy coherent and grounded. Use a calm natural expression. No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
   ].join(' ');
+  return portraitSafeText(prompt, portraitGenerationPromptMaximumLength);
 }
 
 function portraitEditPrompt(subject, requestedChange) {
