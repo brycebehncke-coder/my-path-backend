@@ -37,6 +37,7 @@ import {
   playIntegrityRequestHash,
   portraitEditPrompt,
   portraitGenerationPrompt,
+  portraitGenerationRequestBody,
   portraitLifeStage,
   recordAIContentReport,
   routeForModel,
@@ -55,6 +56,18 @@ test('portrait stages are derived from the authoritative age', () => {
   assert.equal(portraitLifeStage(13), 'teen');
   assert.equal(portraitLifeStage(18), 'adult');
   assert.equal(portraitLifeStage(65), 'elderly');
+});
+
+test('portrait generation body uses only fields accepted by the Cloudflare REST model', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'profile-rest-contract',
+    age: 28,
+    species: 'person',
+  });
+  const body = portraitGenerationRequestBody(subject);
+  assert.deepEqual(Object.keys(body).sort(), ['prompt', 'steps']);
+  assert.equal(body.steps, 4);
+  assert.equal('seed' in body, false);
 });
 
 test('portrait subjects preserve unusual custom-life species without accepting prompt-sized fields', () => {

@@ -1435,6 +1435,13 @@ async function cloudflarePortraitImage(response) {
   return { image, mimeType: 'image/jpeg' };
 }
 
+function portraitGenerationRequestBody(subject) {
+  return {
+    prompt: portraitGenerationPrompt(subject),
+    steps: 4,
+  };
+}
+
 async function generateCloudflarePortrait(subject) {
   const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
     method: 'POST',
@@ -1443,11 +1450,7 @@ async function generateCloudflarePortrait(subject) {
       'Content-Type': 'application/json',
       Accept: 'application/json',
     },
-    body: JSON.stringify({
-      prompt: portraitGenerationPrompt(subject),
-      steps: 4,
-      seed: portraitSeed(subject, 'generate'),
-    }),
+    body: JSON.stringify(portraitGenerationRequestBody(subject)),
   });
   return cloudflarePortraitImage(response);
 }
@@ -2496,6 +2499,7 @@ export {
   parseCreatorCodeCatalog,
   portraitEditPrompt,
   portraitGenerationPrompt,
+  portraitGenerationRequestBody,
   portraitLifeStage,
   playerQuotaHash,
   playerQuotaReceipt,
