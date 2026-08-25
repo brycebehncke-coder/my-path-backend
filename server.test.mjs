@@ -29,11 +29,15 @@ import {
   isGPT5MiniCustomBirthDossierRequest,
   mergedUsage,
   normalizeAIContentReport,
+  normalizePortraitSubject,
   normalizeModelName,
   normalizePlayerIdentifier,
   playerQuotaHash,
   playerQuotaReceipt,
   playIntegrityRequestHash,
+  portraitEditPrompt,
+  portraitGenerationPrompt,
+  portraitLifeStage,
   recordAIContentReport,
   routeForModel,
   validatePlayIntegrityVerdict,
@@ -43,6 +47,55 @@ import {
   verifyGenuineAppRequest,
   verifyPlayIntegrityRequest,
 } from './server.mjs';
+
+test('portrait stages are derived from the authoritative age', () => {
+  assert.equal(portraitLifeStage(0), 'baby');
+  assert.equal(portraitLifeStage(3), 'baby');
+  assert.equal(portraitLifeStage(4), 'child');
+  assert.equal(portraitLifeStage(13), 'teen');
+  assert.equal(portraitLifeStage(18), 'adult');
+  assert.equal(portraitLifeStage(65), 'elderly');
+});
+
+test('portrait subjects preserve unusual custom-life species without accepting prompt-sized fields', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'profile-123',
+    name: 'Mara',
+    gender: 'female',
+    age: 9,
+    life_stage: 'elderly',
+    role: 'player',
+    species: 'sea dragon',
+    location: 'a floating kingdom',
+    era: 'the far future',
+    subject_description: 'A curious explorer with translucent fins.',
+    appearance_description: 'green eyes and silver markings',
+    revision: 2,
+  });
+  assert.equal(subject.lifeStage, 'child');
+  assert.equal(subject.species, 'sea dragon');
+  assert.equal(subject.revision, 2);
+  assert.match(portraitGenerationPrompt(subject), /sea dragon/);
+  assert.match(portraitGenerationPrompt(subject), /exactly one subject/i);
+  assert.throws(
+    () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
+    /profile_id/i,
+  );
+});
+
+test('portrait editing applies only the requested appearance change to image zero', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'profile-456',
+    age: 24,
+    species: 'person',
+    revision: 1,
+  });
+  const prompt = portraitEditPrompt(subject, 'give her short blue hair');
+  assert.match(prompt, /image 0/i);
+  assert.match(prompt, /short blue hair/i);
+  assert.match(prompt, /same character/i);
+  assert.throws(() => portraitEditPrompt(subject, '   '), /appearance change/i);
+});
 
 test('AI content reports contain no story text or identifying story details', () => {
   const normalized = normalizeAIContentReport({

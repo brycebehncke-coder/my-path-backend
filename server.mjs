@@ -12,9 +12,20 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt5-mini-age-continuity-v2';
+const backendRevision = 'generated-character-portraits-v1';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
+const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
+const cloudflareApiToken = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
+const portraitGenerationModel = '@cf/black-forest-labs/flux-1-schnell';
+const portraitEditingModel = '@cf/black-forest-labs/flux-2-klein-4b';
+const portraitRequestMaximumPerPlayerPerDay = configuredPositiveInteger(
+  process.env.PORTRAIT_REQUEST_MAX_PER_PLAYER_PER_DAY,
+  200,
+  5,
+  2_000,
+);
+const portraitRequestCountsByPlayerDay = new Map();
 const creatorCodesJSON = process.env.CREATOR_CODES_JSON || '';
 const creatorCodeFailureWindowMs = 10 * 60 * 1000;
 const creatorCodeMaximumFailuresPerWindow = 15;
@@ -1271,6 +1282,194 @@ function recordCreatorCodeFailure(address, at = Date.now()) {
   }
 }
 
+const portraitLifeStages = ['baby', 'child', 'teen', 'adult', 'elderly'];
+
+function portraitSafeText(value, maximumLength = 180) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maximumLength);
+}
+
+function portraitLifeStage(age, requestedStage = '') {
+  const numericAge = Number.isFinite(Number(age)) ? Math.max(0, Math.floor(Number(age))) : 0;
+  if (numericAge <= 3) return 'baby';
+  if (numericAge <= 12) return 'child';
+  if (numericAge <= 17) return 'teen';
+  if (numericAge <= 64) return 'adult';
+  if (numericAge > 64) return 'elderly';
+  const normalized = portraitSafeText(requestedStage, 20).toLowerCase();
+  return portraitLifeStages.includes(normalized) ? normalized : 'adult';
+}
+
+function normalizePortraitSubject(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    throw new Error('Portrait request must be a JSON object.');
+  }
+  const profileId = portraitSafeText(body.profile_id, 120);
+  if (!profileId || !/^[A-Za-z0-9._:-]+$/.test(profileId)) {
+    throw new Error('A valid profile_id is required.');
+  }
+  const age = Number.isFinite(Number(body.age))
+    ? Math.max(0, Math.min(10_000, Math.floor(Number(body.age))))
+    : 0;
+  const revision = Number.isFinite(Number(body.revision))
+    ? Math.max(0, Math.min(10_000, Math.floor(Number(body.revision))))
+    : 0;
+  return {
+    profileId,
+    name: portraitSafeText(body.name, 100),
+    gender: portraitSafeText(body.gender, 60),
+    age,
+    lifeStage: portraitLifeStage(age, body.life_stage),
+    role: portraitSafeText(body.role, 80),
+    species: portraitSafeText(body.species, 100) || 'person',
+    location: portraitSafeText(body.location, 160),
+    era: portraitSafeText(body.era, 80),
+    subjectDescription: portraitSafeText(body.subject_description, 500),
+    appearanceDescription: portraitSafeText(body.appearance_description, 320),
+    revision,
+  };
+}
+
+function portraitGenerationPrompt(subject) {
+  const facts = [
+    `${subject.lifeStage} ${subject.species}`,
+    subject.gender && `gender: ${subject.gender}`,
+    subject.role && `role in the life: ${subject.role}`,
+    subject.location && `from ${subject.location}`,
+    subject.era && `living in ${subject.era}`,
+    subject.appearanceDescription && `appearance: ${subject.appearanceDescription}`,
+    subject.subjectDescription && `life-specific details: ${subject.subjectDescription}`,
+  ].filter(Boolean).join('. ');
+  return [
+    'Create one complete character portrait for a life-simulation mobile game.',
+    facts,
+    'Use simple low-detail 2D illustrated game art with clean solid shapes and gentle shading; not pixel art and not photorealistic.',
+    'Show exactly one subject, centered and facing forward, head and shoulders visible, with a plain unobtrusive background.',
+    'Make the age, species, clothing, culture, and historical era coherent. No words, labels, logos, borders, UI, extra people, or duplicate body parts.',
+  ].join(' ');
+}
+
+function portraitEditPrompt(subject, requestedChange) {
+  const change = portraitSafeText(requestedChange, 320);
+  if (!change) throw new Error('Describe the appearance change to make.');
+  return [
+    'Edit image 0 and keep it as the exact same character.',
+    `Apply this requested appearance change: ${change}.`,
+    `The subject remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
+    'Preserve identity, facial structure, age, species, pose, crop, proportions, art style, lighting, clothing unless requested, and background.',
+    'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
+  ].join(' ');
+}
+
+function decodedPortraitReferenceImage(rawValue) {
+  const raw = portraitSafeText(rawValue, 1_500_000).replace(/^data:image\/[A-Za-z0-9.+-]+;base64,/, '');
+  if (!raw || !/^[A-Za-z0-9+/=_-]+$/.test(raw)) {
+    throw new Error('A valid cached portrait is required for editing.');
+  }
+  const normalized = raw.replace(/-/g, '+').replace(/_/g, '/');
+  const image = Buffer.from(normalized, 'base64');
+  if (image.length < 100 || image.length > 750_000) {
+    throw new Error('The cached portrait has an unsupported size.');
+  }
+  return image;
+}
+
+function portraitSeed(subject, suffix = '') {
+  return createHash('sha256')
+    .update(`${subject.profileId}\0${subject.lifeStage}\0${subject.revision}\0${suffix}`)
+    .digest()
+    .readUInt32BE(0) & 0x7fffffff;
+}
+
+function portraitRequestIsAllowed(playerHash, at = new Date()) {
+  const day = playerQuotaUTCDateKey(at);
+  const key = `${playerHash}:${day}`;
+  const used = portraitRequestCountsByPlayerDay.get(key) || 0;
+  if (used >= portraitRequestMaximumPerPlayerPerDay) return false;
+  portraitRequestCountsByPlayerDay.set(key, used + 1);
+  if (portraitRequestCountsByPlayerDay.size > 25_000) {
+    for (const existingKey of portraitRequestCountsByPlayerDay.keys()) {
+      if (!existingKey.endsWith(`:${day}`)) portraitRequestCountsByPlayerDay.delete(existingKey);
+    }
+  }
+  return true;
+}
+
+function cloudflarePortraitURL(model) {
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(cloudflareAccountId)}/ai/run/${model}`;
+}
+
+async function cloudflarePortraitImage(response) {
+  const contentType = (response.headers.get('content-type') || '').toLowerCase();
+  if (contentType.startsWith('image/')) {
+    return {
+      image: Buffer.from(await response.arrayBuffer()),
+      mimeType: contentType.split(';')[0] || 'image/jpeg',
+    };
+  }
+  const text = await response.text();
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = { raw: text };
+  }
+  if (!response.ok || payload?.success === false) {
+    const detail = payload?.errors?.[0]?.message
+      || payload?.error?.message
+      || payload?.raw
+      || `Cloudflare returned HTTP ${response.status}.`;
+    throw new Error(`Portrait generation failed: ${portraitSafeText(detail, 300)}`);
+  }
+  const encoded = payload?.result?.image || payload?.image;
+  if (typeof encoded !== 'string' || !encoded.trim()) {
+    throw new Error('Portrait generation returned no image.');
+  }
+  const image = Buffer.from(encoded, 'base64');
+  if (image.length < 100 || image.length > 4_000_000) {
+    throw new Error('Portrait generation returned an invalid image size.');
+  }
+  return { image, mimeType: 'image/jpeg' };
+}
+
+async function generateCloudflarePortrait(subject) {
+  const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${cloudflareApiToken}`,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      prompt: portraitGenerationPrompt(subject),
+      steps: 4,
+      seed: portraitSeed(subject, 'generate'),
+    }),
+  });
+  return cloudflarePortraitImage(response);
+}
+
+async function editCloudflarePortrait(subject, requestedChange, referenceImage) {
+  const form = new FormData();
+  form.append('prompt', portraitEditPrompt(subject, requestedChange));
+  form.append('width', '512');
+  form.append('height', '512');
+  form.append('seed', String(portraitSeed(subject, requestedChange)));
+  form.append('input_image_0', new Blob([referenceImage], { type: 'image/jpeg' }), 'portrait.jpg');
+  const response = await fetch(cloudflarePortraitURL(portraitEditingModel), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${cloudflareApiToken}`,
+      Accept: 'application/json',
+    },
+    body: form,
+  });
+  return cloudflarePortraitImage(response);
+}
+
 function sendJson(res, statusCode, payload, additionalHeaders = {}) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
@@ -1289,13 +1488,13 @@ function sendText(res, statusCode, text) {
   res.end(text);
 }
 
-async function readJsonBody(req) {
+async function readJsonBody(req, maximumBytes = 1_000_000) {
   const chunks = [];
   let total = 0;
 
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > 1_000_000) {
+    if (total > maximumBytes) {
       throw new Error('Request body too large');
     }
     chunks.push(chunk);
@@ -1728,6 +1927,8 @@ const server = createServer(async (req, res) => {
           '/v1/app-attest/challenge',
           '/v1/app-attest/register',
           '/v1/chat/completions',
+          '/v1/portraits/generate',
+          '/v1/portraits/edit',
           '/v1/creator-codes/redeem',
           '/v1/player-safety/account-deleted',
           '/v1/content-reports',
@@ -1738,6 +1939,100 @@ const server = createServer(async (req, res) => {
           required_build: appAttestRequiredBuild,
         },
       });
+    }
+
+    if (req.method === 'POST'
+        && (url.pathname === '/v1/portraits/generate' || url.pathname === '/v1/portraits/edit')) {
+      let parsed;
+      try {
+        parsed = await readJsonBody(req, 2_000_000);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'portrait_request_invalid',
+            message: error instanceof Error ? error.message : 'Invalid portrait request.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      const at = new Date();
+      const identity = playerQuotaIdentity(req);
+      try {
+        await verifyGenuineAppRequest({
+          req,
+          pathname: url.pathname,
+          rawBody: parsed.rawBody,
+          identity,
+          at,
+        });
+      } catch (error) {
+        return sendGenuineAppError(res, error);
+      }
+
+      if (!cloudflareAccountId || !cloudflareApiToken) {
+        return sendJson(res, 503, {
+          error: {
+            code: 'portrait_provider_not_configured',
+            message: 'AI character portraits are temporarily unavailable.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      let subject;
+      try {
+        subject = normalizePortraitSubject(parsed.body);
+      } catch (error) {
+        return sendJson(res, 400, {
+          error: {
+            code: 'portrait_subject_invalid',
+            message: error instanceof Error ? error.message : 'Invalid character details.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      if (!portraitRequestIsAllowed(identity.hash, at)) {
+        return sendJson(res, 429, {
+          error: {
+            code: 'portrait_daily_limit',
+            message: 'This player has reached today\'s character portrait limit.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
+
+      try {
+        let result;
+        let model;
+        if (url.pathname === '/v1/portraits/edit') {
+          const referenceImage = decodedPortraitReferenceImage(parsed.body?.reference_image_base64);
+          result = await editCloudflarePortrait(
+            subject,
+            parsed.body?.requested_change,
+            referenceImage,
+          );
+          model = portraitEditingModel;
+        } else {
+          result = await generateCloudflarePortrait(subject);
+          model = portraitGenerationModel;
+        }
+        return sendJson(res, 200, {
+          ok: true,
+          portrait_id: `${subject.profileId}:${subject.lifeStage}:${subject.revision}`,
+          profile_id: subject.profileId,
+          life_stage: subject.lifeStage,
+          revision: subject.revision,
+          model,
+          mime_type: result.mimeType,
+          image_base64: result.image.toString('base64'),
+        }, { 'Cache-Control': 'no-store' });
+      } catch (error) {
+        console.error('Portrait provider request failed:', error instanceof Error ? error.message : error);
+        return sendJson(res, 502, {
+          error: {
+            code: 'portrait_generation_failed',
+            message: 'The character portrait could not be generated right now.',
+          },
+        }, { 'Cache-Control': 'no-store' });
+      }
     }
 
     if (req.method === 'POST' && url.pathname === '/v1/app-attest/challenge') {
@@ -2193,11 +2488,15 @@ export {
   forwardedChatBody,
   mergedUsage,
   normalizeAIContentReport,
+  normalizePortraitSubject,
   modelRoutes,
   normalizePlayerIdentifier,
   normalizeCreatorCode,
   normalizeModelName,
   parseCreatorCodeCatalog,
+  portraitEditPrompt,
+  portraitGenerationPrompt,
+  portraitLifeStage,
   playerQuotaHash,
   playerQuotaReceipt,
   playerQuotaUTCDateKey,
