@@ -12,13 +12,15 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v1';
+const backendRevision = 'generated-character-portraits-v2';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
 const cloudflareApiToken = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
 const portraitGenerationModel = '@cf/black-forest-labs/flux-1-schnell';
 const portraitEditingModel = '@cf/black-forest-labs/flux-2-klein-4b';
+const portraitGenerationEstimatedCostUSD = 0.0006336;
+const portraitEditingEstimatedCostUSD = 0.000346;
 const portraitRequestMaximumPerPlayerPerDay = configuredPositiveInteger(
   process.env.PORTRAIT_REQUEST_MAX_PER_PLAYER_PER_DAY,
   200,
@@ -105,6 +107,8 @@ const aiContentReportAggregateCounts = new Map();
 const aiContentReportCategories = new Set(['offensive_or_inappropriate']);
 const gpt5MiniBirthNarrationTokenBudget = 900;
 const gpt5MiniBirthNarrationInstruction = 'Return the complete visible birth opening immediately. Preserve every supplied fact and follow the requested prose length, paragraph rhythm, voice, and response format exactly.';
+const gpt5MiniCustomBirthTokenBudget = 2400;
+const gpt5MiniCustomBirthInstruction = 'Return one complete custom-life JSON dossier immediately. Preserve the player request exactly, keep every person and possession consistent with the opening, and close the JSON object.';
 const gpt5MiniAnnualAgeTokenBudget = 900;
 const gpt5MiniAnnualAgeInstruction = 'Return a complete non-empty visible Age passage now. Begin directly inside the fresh event; do not narrate the time jump, age number, growing older, or growing taller. Use the supplied life state, finish every sentence, and return prose only.';
 
@@ -1333,6 +1337,12 @@ function normalizePortraitSubject(body) {
   };
 }
 
+function portraitEstimatedCostUSD(operation) {
+  return operation === 'edit'
+    ? portraitEditingEstimatedCostUSD
+    : portraitGenerationEstimatedCostUSD;
+}
+
 function portraitGenerationPrompt(subject) {
   const facts = [
     `${subject.lifeStage} ${subject.species}`,
@@ -1346,9 +1356,10 @@ function portraitGenerationPrompt(subject) {
   return [
     'Create one complete character portrait for a life-simulation mobile game.',
     facts,
-    'Use simple low-detail 2D illustrated game art with clean solid shapes and gentle shading; not pixel art and not photorealistic.',
+    'Use mildly pixelated low-resolution 2D game art with readable small pixel blocks, clean shapes, restrained detail, and gentle shading. Keep it polished and recognizable, not chunky 8-bit art and not photorealistic.',
     'Show exactly one subject, centered and facing forward, head and shoulders visible, with a plain unobtrusive background.',
-    'Make the age, species, clothing, culture, and historical era coherent. No words, labels, logos, borders, UI, extra people, or duplicate body parts.',
+    'Make the age, exact species, clothing, culture, and historical era coherent. Animals must have recognizable natural anatomy, proportions, fur, feathers, scales, or skin for their species. Do not humanize an animal, give it a human face or body, dress it in human clothing, or make it a mascot unless the life facts explicitly say it is anthropomorphic.',
+    'Use a restrained life-sim portrait style rather than an exaggerated or super-cartoony expression. No words, labels, logos, borders, UI, extra people, or duplicate body parts.',
   ].join(' ');
 }
 
@@ -1359,7 +1370,8 @@ function portraitEditPrompt(subject, requestedChange) {
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
     `The subject remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
-    'Preserve identity, facial structure, age, species, pose, crop, proportions, art style, lighting, clothing unless requested, and background.',
+    'Preserve identity, facial structure, age, exact species, natural anatomy, pose, crop, proportions, mildly pixelated low-resolution art style, lighting, clothing unless requested, and background.',
+    'For animals, preserve recognizable natural species anatomy and avoid human or mascot features unless the existing image and life facts are explicitly anthropomorphic.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].join(' ');
 }
@@ -1698,9 +1710,53 @@ function isGPT5MiniBirthNarrationRequest(body) {
 }
 
 function isGPT5MiniCustomBirthDossierRequest(body) {
+  const promptCacheKey = String(body?.prompt_cache_key || '').trim();
+  if (
+    promptCacheKey === 'my-path-open-custom-takeover-v1'
+    || promptCacheKey === 'my-path-open-custom-takeover-v2'
+    || promptCacheKey === 'my-path-open-custom-takeover-v4'
+    || promptCacheKey === 'my-path-open-custom-takeover-v5'
+    || promptCacheKey === 'my-path-open-custom-takeover-v6'
+    || promptCacheKey === 'my-path-open-custom-birth-v2'
+  ) {
+    return true;
+  }
   const schemaName = String(body?.response_format?.json_schema?.name || '').trim();
-  return schemaName === 'gpt5_custom_birth_launch_v2'
-    || schemaName === 'gpt5_custom_birth_launch_v3';
+  return schemaName === 'gpt5_custom_takeover_launch_v2'
+    || schemaName === 'gpt5_custom_birth_launch_v2'
+    || schemaName === 'gpt5_custom_birth_launch_v3'
+    || schemaName === 'gpt5_custom_birth_launch_v4'
+    || schemaName === 'gpt5_custom_birth_launch_v5'
+    || schemaName === 'gpt5_open_custom_takeover_launch_v4'
+    || schemaName === 'gpt5_open_custom_takeover_launch_v5';
+}
+
+function gpt5MiniCustomBirthResponseNeedsRetry(payload, forwardedBody) {
+  if (!isGPT5MiniCustomBirthDossierRequest(forwardedBody)) {
+    return false;
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  const finishReason = payload?.choices?.[0]?.finish_reason;
+  return (typeof content !== 'string' || !content.trim()) && finishReason === 'length';
+}
+
+function gpt5MiniCustomBirthRetryBody(
+  forwardedBody,
+  route = routeForModel(forwardedBody?.model),
+) {
+  return {
+    ...forwardedBody,
+    max_completion_tokens: Math.max(
+      Number(forwardedBody?.max_completion_tokens) || 0,
+      gpt5MiniCustomBirthTokenBudget,
+    ),
+    reasoning_effort: compatibleOpenAIReasoningEffort(route, forwardedBody?.reasoning_effort),
+    verbosity: 'low',
+    messages: appendSystemInstruction(
+      forwardedBody.messages,
+      gpt5MiniCustomBirthInstruction,
+    ),
+  };
 }
 
 function gpt5MiniBirthResponseNeedsRetry(payload, forwardedBody) {
@@ -1867,6 +1923,11 @@ async function proxyChatCompletion(body, route) {
     retryBody = gpt5MiniBirthRetryBody(forwarded, route);
   } else if (
     isOpenAIReasoningRoute(route)
+    && gpt5MiniCustomBirthResponseNeedsRetry(first.payload, forwarded)
+  ) {
+    retryBody = gpt5MiniCustomBirthRetryBody(forwarded, route);
+  } else if (
+    isOpenAIReasoningRoute(route)
     && gpt5MiniAnnualAgeResponseNeedsRetry(first.payload, forwarded)
   ) {
     retryBody = gpt5MiniAnnualAgeRetryBody(forwarded, route);
@@ -1879,6 +1940,18 @@ async function proxyChatCompletion(body, route) {
   if (birthRequest && port === 39005) {
     const content = second.payload?.choices?.[0]?.message?.content;
     console.info('GPT5_BIRTH_UPSTREAM', {
+      attempt: 2,
+      elapsed_ms: Date.now() - retryStartedAt,
+      total_elapsed_ms: Date.now() - requestStartedAt,
+      ok: second.ok,
+      finish_reason: second.payload?.choices?.[0]?.finish_reason || null,
+      visible_characters: typeof content === 'string' ? content.trim().length : 0,
+      completion_tokens: Number(second.payload?.usage?.completion_tokens || 0),
+    });
+  }
+  if (customBirthRequest && port === 39005) {
+    const content = second.payload?.choices?.[0]?.message?.content;
+    console.info('GPT5_CUSTOM_BIRTH_UPSTREAM', {
       attempt: 2,
       elapsed_ms: Date.now() - retryStartedAt,
       total_elapsed_ms: Date.now() - requestStartedAt,
@@ -2005,6 +2078,7 @@ const server = createServer(async (req, res) => {
       try {
         let result;
         let model;
+        let operation;
         if (url.pathname === '/v1/portraits/edit') {
           const referenceImage = decodedPortraitReferenceImage(parsed.body?.reference_image_base64);
           result = await editCloudflarePortrait(
@@ -2013,9 +2087,11 @@ const server = createServer(async (req, res) => {
             referenceImage,
           );
           model = portraitEditingModel;
+          operation = 'edit';
         } else {
           result = await generateCloudflarePortrait(subject);
           model = portraitGenerationModel;
+          operation = 'generation';
         }
         return sendJson(res, 200, {
           ok: true,
@@ -2024,6 +2100,8 @@ const server = createServer(async (req, res) => {
           life_stage: subject.lifeStage,
           revision: subject.revision,
           model,
+          operation,
+          estimated_cost_usd: portraitEstimatedCostUSD(operation),
           mime_type: result.mimeType,
           image_base64: result.image.toString('base64'),
         }, { 'Cache-Control': 'no-store' });
@@ -2483,6 +2561,8 @@ export {
   deepSeekResponseNeedsRetry,
   gpt5MiniBirthResponseNeedsRetry,
   gpt5MiniBirthRetryBody,
+  gpt5MiniCustomBirthResponseNeedsRetry,
+  gpt5MiniCustomBirthRetryBody,
   gpt5MiniAnnualAgeResponseNeedsRetry,
   gpt5MiniAnnualAgeRetryBody,
   isGPT5MiniAnnualAgeRequest,
@@ -2501,6 +2581,7 @@ export {
   portraitGenerationPrompt,
   portraitGenerationRequestBody,
   portraitLifeStage,
+  portraitEstimatedCostUSD,
   playerQuotaHash,
   playerQuotaReceipt,
   playerQuotaUTCDateKey,

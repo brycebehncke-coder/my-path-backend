@@ -21,6 +21,8 @@ import {
   forwardedChatBody,
   gpt5MiniBirthResponseNeedsRetry,
   gpt5MiniBirthRetryBody,
+  gpt5MiniCustomBirthResponseNeedsRetry,
+  gpt5MiniCustomBirthRetryBody,
   gpt5MiniAnnualAgeResponseNeedsRetry,
   gpt5MiniAnnualAgeRetryBody,
   issueAppAttestChallenges,
@@ -39,6 +41,7 @@ import {
   portraitGenerationPrompt,
   portraitGenerationRequestBody,
   portraitLifeStage,
+  portraitEstimatedCostUSD,
   recordAIContentReport,
   routeForModel,
   validatePlayIntegrityVerdict,
@@ -89,11 +92,20 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.equal(subject.species, 'sea dragon');
   assert.equal(subject.revision, 2);
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
-  assert.match(portraitGenerationPrompt(subject), /exactly one subject/i);
+  const prompt = portraitGenerationPrompt(subject);
+  assert.match(prompt, /exactly one subject/i);
+  assert.match(prompt, /mildly pixelated/i);
+  assert.match(prompt, /natural anatomy/i);
+  assert.match(prompt, /not.*super-cartoony/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
   );
+});
+
+test('portrait list-price estimates distinguish generation from editing', () => {
+  assert.equal(portraitEstimatedCostUSD('generation'), 0.0006336);
+  assert.equal(portraitEstimatedCostUSD('edit'), 0.000346);
 });
 
 test('portrait editing applies only the requested appearance change to image zero', () => {
@@ -107,6 +119,8 @@ test('portrait editing applies only the requested appearance change to image zer
   assert.match(prompt, /image 0/i);
   assert.match(prompt, /short blue hair/i);
   assert.match(prompt, /same character/i);
+  assert.match(prompt, /mildly pixelated/i);
+  assert.match(prompt, /natural species anatomy/i);
   assert.throws(() => portraitEditPrompt(subject, '   '), /appearance change/i);
 });
 
@@ -463,19 +477,78 @@ test('recognizes the compact GPT-5 custom birth launch schema', () => {
       json_schema: { name: 'gpt5_custom_birth_launch_v2', schema: { type: 'object' } },
     },
   };
-  assert.equal(isGPT5MiniCustomBirthDossierRequest(request), true);
-  assert.equal(isGPT5MiniCustomBirthDossierRequest({
-    ...request,
-    response_format: {
-      type: 'json_schema',
-      json_schema: { name: 'gpt5_custom_birth_launch_v3', schema: { type: 'object' } },
-    },
-  }), true);
+  for (const name of [
+    'gpt5_custom_birth_launch_v2',
+    'gpt5_custom_birth_launch_v3',
+    'gpt5_custom_birth_launch_v4',
+    'gpt5_custom_birth_launch_v5',
+    'gpt5_open_custom_takeover_launch_v5',
+  ]) {
+    assert.equal(isGPT5MiniCustomBirthDossierRequest({
+      ...request,
+      response_format: {
+        type: 'json_schema',
+        json_schema: { name, schema: { type: 'object' } },
+      },
+    }), true);
+  }
   assert.equal(
     forwardedChatBody(request, routeForModel('gpt-5-mini')).verbosity,
     'low',
   );
   assert.equal(isGPT5MiniBirthNarrationRequest(request), false);
+  assert.equal(isGPT5MiniCustomBirthDossierRequest({
+    model: 'gpt-5-mini',
+    prompt_cache_key: 'my-path-open-custom-takeover-v1',
+    response_format: { type: 'json_object' },
+  }), true);
+  assert.equal(isGPT5MiniCustomBirthDossierRequest({
+    model: 'gpt-5-mini',
+    prompt_cache_key: 'my-path-open-custom-takeover-v2',
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'gpt5_custom_takeover_launch_v2', schema: { type: 'object' } },
+    },
+  }), true);
+  for (const promptCacheKey of [
+    'my-path-open-custom-birth-v2',
+    'my-path-open-custom-takeover-v4',
+    'my-path-open-custom-takeover-v6',
+  ]) {
+    const openRequest = {
+      model: 'gpt-5-mini',
+      prompt_cache_key: promptCacheKey,
+      response_format: { type: 'json_object' },
+    };
+    assert.equal(isGPT5MiniCustomBirthDossierRequest(openRequest), true);
+    assert.equal(
+      forwardedChatBody(openRequest, routeForModel('gpt-5-mini')).verbosity,
+      'low',
+    );
+  }
+});
+
+test('retries an empty length-limited GPT-5 custom dossier with a larger budget', () => {
+  const request = {
+    model: 'gpt-5-mini',
+    messages: [{ role: 'system', content: 'Simulate a custom life.' }],
+    max_tokens: 1600,
+    response_format: {
+      type: 'json_schema',
+      json_schema: { name: 'gpt5_custom_birth_launch_v5', schema: { type: 'object' } },
+    },
+  };
+  const route = routeForModel('gpt-5-mini');
+  const forwarded = forwardedChatBody(request, route);
+  const exhausted = {
+    choices: [{ finish_reason: 'length', message: { content: '' } }],
+  };
+
+  assert.equal(gpt5MiniCustomBirthResponseNeedsRetry(exhausted, forwarded), true);
+  const retry = gpt5MiniCustomBirthRetryBody(forwarded, route);
+  assert.equal(retry.max_completion_tokens, 2400);
+  assert.equal(retry.verbosity, 'low');
+  assert.match(retry.messages[0].content, /complete custom-life JSON dossier/);
 });
 
 test('retries empty length-limited GPT-5 births with model-compatible effort and full budget', () => {
