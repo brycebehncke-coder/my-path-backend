@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v4-provider-limit-safe';
+const backendRevision = 'generated-character-portraits-v5-life-identity';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1334,6 +1334,9 @@ function normalizePortraitSubject(body) {
     era: portraitSafeText(body.era, 80),
     subjectDescription: portraitSafeText(body.subject_description, 500),
     appearanceDescription: portraitSafeText(body.appearance_description, 320),
+    visualIdentity: portraitSafeText(body.visual_identity, 360),
+    familyIdentity: portraitSafeText(body.family_identity, 360),
+    occupation: portraitSafeText(body.occupation, 140),
     revision,
   };
 }
@@ -1346,22 +1349,28 @@ function portraitEstimatedCostUSD(operation) {
 
 function portraitGenerationPrompt(subject) {
   const facts = [
+    subject.name && `exact subject name: ${portraitSafeText(subject.name, 60)}`,
     `exact chronological age: ${subject.age} years old (${subject.lifeStage})`,
-    `exact species or breed: ${portraitSafeText(subject.species, 60)}`,
-    subject.gender && `gender: ${portraitSafeText(subject.gender, 24)}`,
-    subject.role && `role: ${portraitSafeText(subject.role, 40)}`,
-    subject.location && `place: ${portraitSafeText(subject.location, 80)}`,
-    subject.era && `era: ${portraitSafeText(subject.era, 48)}`,
-    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 140)}`,
-    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 180)}`,
+    `exact species or breed: ${portraitSafeText(subject.species, 50)}`,
+    subject.gender && `gender: ${portraitSafeText(subject.gender, 20)}`,
+    subject.role && `role: ${portraitSafeText(subject.role, 30)}`,
+    subject.occupation && `occupation: ${portraitSafeText(subject.occupation, 50)}`,
+    subject.location && `place: ${portraitSafeText(subject.location, 60)}`,
+    subject.era && `era: ${portraitSafeText(subject.era, 32)}`,
+    subject.visualIdentity && `authoritative individual identity: ${portraitSafeText(subject.visualIdentity, 110)}`,
+    subject.familyIdentity && `biological family inheritance: ${portraitSafeText(subject.familyIdentity, 110)}`,
+    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 70)}`,
+    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 70)}`,
   ].filter(Boolean).join('; ');
   const prompt = [
     'Create one polished simplified life-simulation portrait, not a photograph, pixel art, anime, chibi, mascot, or exaggerated cartoon.',
-    facts,
-    'Show exactly one subject, centered and forward-facing, with a natural head-and-upper-body crop, plain background, restrained detail, clean color, and gentle texture.',
-    'The exact age is binding. Make the subject unmistakably that age. People in their twenties look young; add no wrinkles, gray hair, sagging, or elderly features unless age or appearance requires them. Babies, children, and teens never look adult.',
-    'Respect the exact species or breed, culture, clothing, and era. Interpret animal age by that species lifespan. Real animals keep normal breed anatomy and natural skull, muzzle or beak, eyes, ears, limbs, paws or hooves, fur, feathers, scales, and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
-    'Keep human, humanoid, alien, and fantasy anatomy coherent and grounded. Use a calm natural expression. No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
+    'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
+    `${facts}.`,
+    'Identity and family inheritance are binding. Preserve this named character across ages. Relatives share inherited traits; do not change ancestry or complexion without an explicit life fact.',
+    'Show exactly one subject, centered and forward-facing, upper-body crop, plain background, restrained detail, clean color, gentle texture.',
+    'Exact age is binding. People in their twenties look young; no wrinkles, gray hair, sagging, or elderly features unless required. Babies, children, and teens never look adult.',
+    'Respect exact species or breed, culture, clothing, and era. Real animals keep normal breed anatomy, skull, muzzle or beak, eyes, ears, limbs, paws or hooves, fur, feathers, scales, and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
+    'Keep human, humanoid, alien, and fantasy anatomy coherent. Use a calm natural expression.',
   ].join(' ');
   return portraitSafeText(prompt, portraitGenerationPromptMaximumLength);
 }
@@ -1373,12 +1382,14 @@ function portraitEditPrompt(subject, requestedChange) {
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
     `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
+    subject.visualIdentity && `Preserve this character identity: ${portraitSafeText(subject.visualIdentity, 180)}.`,
+    subject.familyIdentity && `Preserve these inherited family traits: ${portraitSafeText(subject.familyIdentity, 180)}.`,
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
     'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, softly simplified low-detail texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
     'Keep the polished simplified life-simulation art direction. Do not turn the image into a photograph, exaggerated cartoon, mascot, anime, chibi art, or pixel art. The app applies subtle pixelation after editing.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
-  ].join(' ');
+  ].filter(Boolean).join(' ');
 }
 
 function decodedPortraitReferenceImage(rawValue) {

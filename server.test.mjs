@@ -85,6 +85,9 @@ test('portrait generation prompts stay within the Cloudflare 2048-character cont
     era: 'E'.repeat(80),
     appearance_description: 'A'.repeat(320),
     subject_description: 'D'.repeat(500),
+    visual_identity: 'V'.repeat(360),
+    family_identity: 'F'.repeat(360),
+    occupation: 'O'.repeat(140),
   });
   const prompt = portraitGenerationPrompt(subject);
   assert.ok(prompt.length <= 2_000, `prompt was ${prompt.length} characters`);
@@ -92,6 +95,26 @@ test('portrait generation prompts stay within the Cloudflare 2048-character cont
   assert.match(prompt, /people in their twenties look young/i);
   assert.match(prompt, /quadrupeds stay quadrupedal/i);
   assert.match(prompt, /no words, labels, logos/i);
+});
+
+test('portrait prompts preserve the exact character and biological family identity', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'family-identity-profile',
+    name: 'Nadia Okafor',
+    gender: 'female',
+    age: 12,
+    role: 'daughter',
+    species: 'human',
+    occupation: 'student',
+    visual_identity: 'warm deep-brown skin, dark coiled hair, brown eyes, rounded cheeks',
+    family_identity: 'Nigerian family with deep-brown complexions, dark coiled hair, brown eyes, and shared rounded facial features',
+  });
+  const prompt = portraitGenerationPrompt(subject);
+  assert.match(prompt, /exact subject name: Nadia Okafor/i);
+  assert.match(prompt, /authoritative individual identity: warm deep-brown skin/i);
+  assert.match(prompt, /biological family inheritance: Nigerian family/i);
+  assert.match(prompt, /occupation: student/i);
+  assert.match(prompt, /do not change ancestry or complexion/i);
 });
 
 test('portrait subjects preserve unusual custom-life species without accepting prompt-sized fields', () => {
