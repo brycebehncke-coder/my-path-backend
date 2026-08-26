@@ -54,7 +54,8 @@ import {
 
 test('portrait stages are derived from the authoritative age', () => {
   assert.equal(portraitLifeStage(0), 'baby');
-  assert.equal(portraitLifeStage(3), 'baby');
+  assert.equal(portraitLifeStage(1), 'toddler');
+  assert.equal(portraitLifeStage(3), 'toddler');
   assert.equal(portraitLifeStage(4), 'child');
   assert.equal(portraitLifeStage(13), 'teen');
   assert.equal(portraitLifeStage(18), 'adult');
@@ -69,7 +70,7 @@ test('portrait generation body uses only fields accepted by the Cloudflare REST 
   });
   const body = portraitGenerationRequestBody(subject);
   assert.deepEqual(Object.keys(body).sort(), ['prompt', 'steps']);
-  assert.equal(body.steps, 4);
+  assert.equal(body.steps, 6);
   assert.equal('seed' in body, false);
 });
 
@@ -138,14 +139,14 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
   assert.match(prompt, /exactly one subject/i);
-  assert.match(prompt, /polished simplified life-simulation portrait/i);
+  assert.match(prompt, /highly realistic lifelike portrait/i);
   assert.match(prompt, /exact chronological age: 9 years old/i);
-  assert.match(prompt, /not a photograph/i);
+  assert.match(prompt, /photographic anatomy/i);
   assert.match(prompt, /exact species or breed/i);
   assert.match(prompt, /real animals keep normal breed anatomy/i);
   assert.match(prompt, /never give animals human faces/i);
   assert.match(prompt, /anthropomorphism unless explicitly requested/i);
-  assert.match(prompt, /not a photograph, pixel art/i);
+  assert.match(prompt, /never use cartoon, flat or simple illustration/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
@@ -174,7 +175,7 @@ test('portrait editing applies only the requested appearance change to image zer
   assert.match(prompt, /normal animal anatomy/i);
   assert.match(prompt, /never add human facial structure/i);
   assert.match(prompt, /app applies subtle pixelation/i);
-  assert.match(prompt, /simplified life-simulation art direction/i);
+  assert.match(prompt, /highly realistic lifelike AgeUp portrait style/i);
   assert.doesNotMatch(prompt, /mildly pixelated low-resolution art style/i);
   assert.throws(() => portraitEditPrompt(subject, '   '), /appearance change/i);
 });

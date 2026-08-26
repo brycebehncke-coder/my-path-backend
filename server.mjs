@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v5-life-identity';
+const backendRevision = 'generated-character-portraits-v6-lifelike-idle-refresh';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1286,7 +1286,7 @@ function recordCreatorCodeFailure(address, at = Date.now()) {
   }
 }
 
-const portraitLifeStages = ['baby', 'child', 'teen', 'adult', 'elderly'];
+const portraitLifeStages = ['baby', 'toddler', 'child', 'teen', 'adult', 'elderly'];
 const portraitGenerationPromptMaximumLength = 2_000;
 
 function portraitSafeText(value, maximumLength = 180) {
@@ -1299,7 +1299,8 @@ function portraitSafeText(value, maximumLength = 180) {
 
 function portraitLifeStage(age, requestedStage = '') {
   const numericAge = Number.isFinite(Number(age)) ? Math.max(0, Math.floor(Number(age))) : 0;
-  if (numericAge <= 3) return 'baby';
+  if (numericAge === 0) return 'baby';
+  if (numericAge <= 3) return 'toddler';
   if (numericAge <= 12) return 'child';
   if (numericAge <= 17) return 'teen';
   if (numericAge <= 64) return 'adult';
@@ -1349,28 +1350,28 @@ function portraitEstimatedCostUSD(operation) {
 
 function portraitGenerationPrompt(subject) {
   const facts = [
-    subject.name && `exact subject name: ${portraitSafeText(subject.name, 60)}`,
+    subject.name && `exact subject name: ${portraitSafeText(subject.name, 44)}`,
     `exact chronological age: ${subject.age} years old (${subject.lifeStage})`,
-    `exact species or breed: ${portraitSafeText(subject.species, 50)}`,
-    subject.gender && `gender: ${portraitSafeText(subject.gender, 20)}`,
-    subject.role && `role: ${portraitSafeText(subject.role, 30)}`,
-    subject.occupation && `occupation: ${portraitSafeText(subject.occupation, 50)}`,
-    subject.location && `place: ${portraitSafeText(subject.location, 60)}`,
-    subject.era && `era: ${portraitSafeText(subject.era, 32)}`,
-    subject.visualIdentity && `authoritative individual identity: ${portraitSafeText(subject.visualIdentity, 110)}`,
-    subject.familyIdentity && `biological family inheritance: ${portraitSafeText(subject.familyIdentity, 110)}`,
-    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 70)}`,
-    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 70)}`,
+    `exact species or breed: ${portraitSafeText(subject.species, 40)}`,
+    subject.gender && `gender: ${portraitSafeText(subject.gender, 16)}`,
+    subject.role && `role: ${portraitSafeText(subject.role, 22)}`,
+    subject.occupation && `occupation: ${portraitSafeText(subject.occupation, 36)}`,
+    subject.location && `place: ${portraitSafeText(subject.location, 48)}`,
+    subject.era && `era: ${portraitSafeText(subject.era, 24)}`,
+    subject.visualIdentity && `authoritative individual identity: ${portraitSafeText(subject.visualIdentity, 88)}`,
+    subject.familyIdentity && `biological family inheritance: ${portraitSafeText(subject.familyIdentity, 88)}`,
+    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 48)}`,
+    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 48)}`,
   ].filter(Boolean).join('; ');
   const prompt = [
-    'Create one polished simplified life-simulation portrait, not a photograph, pixel art, anime, chibi, mascot, or exaggerated cartoon.',
+    'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.',
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
     `${facts}.`,
-    'Identity and family inheritance are binding. Preserve this named character across ages. Relatives share inherited traits; do not change ancestry or complexion without an explicit life fact.',
-    'Show exactly one subject, centered and forward-facing, upper-body crop, plain background, restrained detail, clean color, gentle texture.',
-    'Exact age is binding. People in their twenties look young; no wrinkles, gray hair, sagging, or elderly features unless required. Babies, children, and teens never look adult.',
+    'Identity and family inheritance are binding. Preserve this character across ages. Relatives share inherited traits; do not change ancestry or complexion without an explicit life fact.',
+    'Show exactly one subject, centered and forward-facing, in professional head-and-upper-body framing against a quiet neutral background.',
+    'Exact age is binding. People in their twenties look young; no wrinkles, gray hair, sagging, or elderly features unless required. Babies, toddlers, children, and teens never look adult.',
     'Respect exact species or breed, culture, clothing, and era. Real animals keep normal breed anatomy, skull, muzzle or beak, eyes, ears, limbs, paws or hooves, fur, feathers, scales, and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
-    'Keep human, humanoid, alien, and fantasy anatomy coherent. Use a calm natural expression.',
+    'Keep human, humanoid, alien, and fantasy anatomy coherent and lifelike. Use a calm natural expression.',
   ].join(' ');
   return portraitSafeText(prompt, portraitGenerationPromptMaximumLength);
 }
@@ -1385,9 +1386,9 @@ function portraitEditPrompt(subject, requestedChange) {
     subject.visualIdentity && `Preserve this character identity: ${portraitSafeText(subject.visualIdentity, 180)}.`,
     subject.familyIdentity && `Preserve these inherited family traits: ${portraitSafeText(subject.familyIdentity, 180)}.`,
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
-    'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, softly simplified low-detail texture, lighting, clothing unless requested, and background.',
+    'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
-    'Keep the polished simplified life-simulation art direction. Do not turn the image into a photograph, exaggerated cartoon, mascot, anime, chibi art, or pixel art. The app applies subtle pixelation after editing.',
+    'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].filter(Boolean).join(' ');
 }
@@ -1466,7 +1467,7 @@ async function cloudflarePortraitImage(response) {
 function portraitGenerationRequestBody(subject) {
   return {
     prompt: portraitGenerationPrompt(subject),
-    steps: 4,
+    steps: 6,
   };
 }
 
