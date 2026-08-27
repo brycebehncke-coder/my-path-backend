@@ -140,6 +140,28 @@ test('portrait prompts request normal slightly happy and rested expressions', ()
   assert.match(editedPrompt, /do not make the subject sad, exhausted, distressed/i);
 });
 
+test('portrait style is explicit and changes the generation contract', () => {
+  const realistic = normalizePortraitSubject({
+    profile_id: 'realistic-style-profile',
+    age: 22,
+    species: 'human',
+    style: 'realistic',
+  });
+  const stylized = normalizePortraitSubject({
+    profile_id: 'stylized-style-profile',
+    age: 22,
+    species: 'human',
+    style: 'stylized',
+  });
+  assert.equal(realistic.style, 'realistic');
+  assert.equal(stylized.style, 'stylized');
+  assert.match(portraitGenerationPrompt(realistic), /highly realistic lifelike portrait/i);
+  assert.match(portraitGenerationPrompt(stylized), /stylized 2D life-simulator character portrait/i);
+  assert.match(portraitGenerationPrompt(stylized), /never copy a named game/i);
+  assert.doesNotMatch(portraitGenerationPrompt(stylized), /highly realistic lifelike portrait/i);
+  assert.match(portraitEditPrompt(stylized, 'add a hat'), /keep the exact friendly stylized 2D/i);
+});
+
 test('portrait prompts preserve the exact character and biological family identity', () => {
   const subject = normalizePortraitSubject({
     profile_id: 'family-identity-profile',

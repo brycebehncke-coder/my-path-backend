@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v7-positive-expression-world-grounding';
+const backendRevision = 'generated-character-portraits-v8-selectable-style-resilient-generation';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1338,6 +1338,9 @@ function normalizePortraitSubject(body) {
     visualIdentity: portraitSafeText(body.visual_identity, 360),
     familyIdentity: portraitSafeText(body.family_identity, 360),
     occupation: portraitSafeText(body.occupation, 140),
+    style: portraitSafeText(body.style, 20).toLowerCase() === 'stylized'
+      ? 'stylized'
+      : 'realistic',
     revision,
   };
 }
@@ -1388,8 +1391,11 @@ function portraitGenerationPrompt(subject) {
     subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 48)}`,
     subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 48)}`,
   ].filter(Boolean).join('; ');
+  const styleDirection = subject.style === 'stylized'
+    ? 'Create one friendly stylized 2D life-simulator character portrait for AgeUp. Use clean rounded shapes, simple expressive facial features, crisp outlines, flat readable colors, low visual detail, and light soft shading. It should feel like a polished casual mobile life game, not photorealistic. Never copy a named game, existing character, logo, or proprietary art exactly. Avoid anime, chibi, 3D rendering, clay, painterly texture, hyperrealism, and photographic detail.'
+    : 'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.';
   const prompt = [
-    'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.',
+    styleDirection,
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
     'Respect the exact species or breed. Real animals keep normal breed anatomy and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
     'Give the subject a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when their anatomy allows it, and a healthy rested appearance. Never make them look sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless an explicit immutable life fact requires that exact appearance.',
@@ -1406,6 +1412,9 @@ function portraitGenerationPrompt(subject) {
 function portraitEditPrompt(subject, requestedChange) {
   const change = portraitSafeText(requestedChange, 320);
   if (!change) throw new Error('Describe the appearance change to make.');
+  const styleDirection = subject.style === 'stylized'
+    ? 'Keep the exact friendly stylized 2D life-simulator portrait style: clean rounded shapes, crisp outlines, flat readable colors, low detail, and light soft shading. Do not turn it photorealistic, 3D, anime, chibi, or painterly, and do not copy any named game or existing character exactly.'
+    : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
   return [
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
@@ -1416,7 +1425,7 @@ function portraitEditPrompt(subject, requestedChange) {
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
     'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
-    'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.',
+    styleDirection,
     'Keep a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when the subject anatomy allows it, and a healthy rested appearance. Do not make the subject sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless the requested change explicitly requires it.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].filter(Boolean).join(' ');
@@ -1437,7 +1446,7 @@ function decodedPortraitReferenceImage(rawValue) {
 
 function portraitSeed(subject, suffix = '') {
   return createHash('sha256')
-    .update(`${subject.profileId}\0${subject.lifeStage}\0${subject.revision}\0${suffix}`)
+    .update(`${subject.profileId}\0${subject.style}\0${subject.lifeStage}\0${subject.revision}\0${suffix}`)
     .digest()
     .readUInt32BE(0) & 0x7fffffff;
 }
@@ -1501,16 +1510,39 @@ function portraitGenerationRequestBody(subject) {
 }
 
 async function generateCloudflarePortrait(subject) {
-  const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${cloudflareApiToken}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
+  let lastError;
+  const requestBodies = [
+    portraitGenerationRequestBody(subject),
+    {
+      prompt: portraitSafeText([
+        subject.style === 'stylized'
+          ? 'Polished simple 2D mobile life-sim portrait with clean shapes and friendly expression.'
+          : 'Lifelike realistic mobile life-sim portrait with natural anatomy and a friendly expression.',
+        `Exactly one ${subject.age}-year-old ${subject.species}.`,
+        subject.gender && `Gender: ${subject.gender}.`,
+        subject.visualIdentity && `Identity: ${subject.visualIdentity}.`,
+        'Centered, forward-facing, quiet background, no text, no extra subjects, no hybrid anatomy.',
+      ].filter(Boolean).join(' '), portraitGenerationPromptMaximumLength),
+      steps: 6,
     },
-    body: JSON.stringify(portraitGenerationRequestBody(subject)),
-  });
-  return cloudflarePortraitImage(response);
+  ];
+  for (const body of requestBodies) {
+    try {
+      const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${cloudflareApiToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      return await cloudflarePortraitImage(response);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('Portrait generation failed.');
 }
 
 async function editCloudflarePortrait(subject, requestedChange, referenceImage) {
