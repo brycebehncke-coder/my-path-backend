@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v6-lifelike-idle-refresh';
+const backendRevision = 'generated-character-portraits-v7-positive-expression-world-grounding';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1348,6 +1348,31 @@ function portraitEstimatedCostUSD(operation) {
     : portraitGenerationEstimatedCostUSD;
 }
 
+function portraitAgeAppearanceDirective(subject) {
+  const age = Math.max(0, Number(subject.age) || 0);
+  if (age === 0) {
+    return 'Age appearance lock: render an unmistakable newborn infant, never an older baby, child, teen, or adult.';
+  }
+  if (age <= 3) {
+    return `Age appearance lock: render an unmistakable ${age}-year-old toddler, never an older child, teen, or adult.`;
+  }
+  if (age <= 12) {
+    return `Age appearance lock: render an unmistakable ${age}-year-old child, never a teen or adult.`;
+  }
+  if (age <= 17) {
+    return `Age appearance lock: render an unmistakable ${age}-year-old teenager, never an adult.`;
+  }
+  if (age <= 39) {
+    return `Age lock: exactly ${age}, an unmistakably young adult with smooth natural skin. No gray hair, deep wrinkles, age spots, sagging, jowls, or elderly features.`;
+  }
+  if (age <= 54) {
+    return `Age appearance lock: for a person or humanoid exactly ${age}, render a healthy middle adult. Do not make them look elderly or add gray hair, deep wrinkles, age spots, sagging, or jowls unless an explicit appearance fact requires it.`;
+  }
+  if (age <= 64) {
+    return `Age appearance lock: for a person or humanoid exactly ${age}, render a late-middle-aged adult, not an elderly person. Use only subtle, natural age cues and no exaggerated wrinkles, gray hair, sagging, or jowls unless an explicit appearance fact requires them.`;
+  }
+  return `Age appearance lock: for a person or humanoid exactly ${age}, show natural older-adult features appropriate to that exact age without exaggeration.`;
+}
 function portraitGenerationPrompt(subject) {
   const facts = [
     subject.name && `exact subject name: ${portraitSafeText(subject.name, 44)}`,
@@ -1366,12 +1391,14 @@ function portraitGenerationPrompt(subject) {
   const prompt = [
     'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.',
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
+    'Respect the exact species or breed. Real animals keep normal breed anatomy and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
+    'Give the subject a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when their anatomy allows it, and a healthy rested appearance. Never make them look sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless an explicit immutable life fact requires that exact appearance.',
     `${facts}.`,
+    portraitAgeAppearanceDirective(subject),
     'Identity and family inheritance are binding. Preserve this character across ages. Relatives share inherited traits; do not change ancestry or complexion without an explicit life fact.',
     'Show exactly one subject, centered and forward-facing, in professional head-and-upper-body framing against a quiet neutral background.',
-    'Exact age is binding. People in their twenties look young; no wrinkles, gray hair, sagging, or elderly features unless required. Babies, toddlers, children, and teens never look adult.',
-    'Respect exact species or breed, culture, clothing, and era. Real animals keep normal breed anatomy, skull, muzzle or beak, eyes, ears, limbs, paws or hooves, fur, feathers, scales, and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
-    'Keep human, humanoid, alien, and fantasy anatomy coherent and lifelike. Use a calm natural expression.',
+    'Respect culture, clothing, and era.',
+    'Keep human, humanoid, alien, and fantasy anatomy coherent and lifelike.',
   ].join(' ');
   return portraitSafeText(prompt, portraitGenerationPromptMaximumLength);
 }
@@ -1383,12 +1410,14 @@ function portraitEditPrompt(subject, requestedChange) {
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
     `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
+    portraitAgeAppearanceDirective(subject),
     subject.visualIdentity && `Preserve this character identity: ${portraitSafeText(subject.visualIdentity, 180)}.`,
     subject.familyIdentity && `Preserve these inherited family traits: ${portraitSafeText(subject.familyIdentity, 180)}.`,
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
     'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
     'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.',
+    'Keep a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when the subject anatomy allows it, and a healthy rested appearance. Do not make the subject sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless the requested change explicitly requires it.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].filter(Boolean).join(' ');
 }

@@ -93,9 +93,51 @@ test('portrait generation prompts stay within the Cloudflare 2048-character cont
   const prompt = portraitGenerationPrompt(subject);
   assert.ok(prompt.length <= 2_000, `prompt was ${prompt.length} characters`);
   assert.match(prompt, /exact chronological age: 29 years old/i);
-  assert.match(prompt, /people in their twenties look young/i);
+  assert.match(prompt, /unmistakably young adult/i);
   assert.match(prompt, /quadrupeds stay quadrupedal/i);
   assert.match(prompt, /no words, labels, logos/i);
+});
+
+test('portrait prompts preserve young and middle-aged parent appearances', () => {
+  const youngParent = normalizePortraitSubject({
+    profile_id: 'young-parent',
+    age: 29,
+    species: 'person',
+  });
+  const youngPrompt = portraitGenerationPrompt(youngParent);
+  assert.match(youngPrompt, /unmistakably young adult/i);
+  assert.match(youngPrompt, /no gray hair, deep wrinkles, age spots, sagging, jowls, or elderly features/i);
+
+  const middleAgedParent = normalizePortraitSubject({
+    profile_id: 'middle-aged-parent',
+    age: 47,
+    species: 'person',
+  });
+  const middlePrompt = portraitGenerationPrompt(middleAgedParent);
+  assert.match(middlePrompt, /healthy middle adult/i);
+  assert.match(middlePrompt, /do not make them look elderly/i);
+
+  const editedPrompt = portraitEditPrompt(youngParent, 'trim their hair');
+  assert.match(editedPrompt, /unmistakably young adult/i);
+  assert.match(editedPrompt, /no gray hair, deep wrinkles, age spots, sagging, jowls, or elderly features/i);
+});
+
+test('portrait prompts request normal slightly happy and rested expressions', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'positive-expression-profile',
+    age: 34,
+    species: 'person',
+  });
+  const generatedPrompt = portraitGenerationPrompt(subject);
+  assert.match(generatedPrompt, /normal, relaxed, slightly happy expression/i);
+  assert.match(generatedPrompt, /gentle natural closed-mouth smile/i);
+  assert.match(generatedPrompt, /healthy rested appearance/i);
+  assert.match(generatedPrompt, /never make them look sad, exhausted, distressed/i);
+
+  const editedPrompt = portraitEditPrompt(subject, 'make their hair shorter');
+  assert.match(editedPrompt, /normal, relaxed, slightly happy expression/i);
+  assert.match(editedPrompt, /healthy rested appearance/i);
+  assert.match(editedPrompt, /do not make the subject sad, exhausted, distressed/i);
 });
 
 test('portrait prompts preserve the exact character and biological family identity', () => {
