@@ -156,10 +156,12 @@ test('portrait style is explicit and changes the generation contract', () => {
   assert.equal(realistic.style, 'realistic');
   assert.equal(stylized.style, 'stylized');
   assert.match(portraitGenerationPrompt(realistic), /highly realistic lifelike portrait/i);
-  assert.match(portraitGenerationPrompt(stylized), /stylized 2D life-simulator character portrait/i);
+  assert.match(portraitGenerationPrompt(stylized), /softly realistic life-simulator portrait/i);
+  assert.match(portraitGenerationPrompt(stylized), /not an ultra-photorealistic photograph/i);
+  assert.match(portraitGenerationPrompt(stylized), /never use cartoon, flat illustration/i);
   assert.match(portraitGenerationPrompt(stylized), /never copy a named game/i);
   assert.doesNotMatch(portraitGenerationPrompt(stylized), /highly realistic lifelike portrait/i);
-  assert.match(portraitEditPrompt(stylized, 'add a hat'), /keep the exact friendly stylized 2D/i);
+  assert.match(portraitEditPrompt(stylized, 'add a hat'), /keep the exact softly realistic life-simulator portrait style/i);
 });
 
 test('portrait prompts preserve the exact character and biological family identity', () => {

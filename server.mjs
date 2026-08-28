@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v8-selectable-style-resilient-generation';
+const backendRevision = 'generated-character-portraits-v9-soft-realistic-exact-age';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1388,11 +1388,11 @@ function portraitGenerationPrompt(subject) {
     subject.era && `era: ${portraitSafeText(subject.era, 24)}`,
     subject.visualIdentity && `authoritative individual identity: ${portraitSafeText(subject.visualIdentity, 88)}`,
     subject.familyIdentity && `biological family inheritance: ${portraitSafeText(subject.familyIdentity, 88)}`,
-    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 48)}`,
-    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 48)}`,
+    subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 180)}`,
+    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 140)}`,
   ].filter(Boolean).join('; ');
   const styleDirection = subject.style === 'stylized'
-    ? 'Create one friendly stylized 2D life-simulator character portrait for AgeUp. Use clean rounded shapes, simple expressive facial features, crisp outlines, flat readable colors, low visual detail, and light soft shading. It should feel like a polished casual mobile life game, not photorealistic. Never copy a named game, existing character, logo, or proprietary art exactly. Avoid anime, chibi, 3D rendering, clay, painterly texture, hyperrealism, and photographic detail.'
+    ? 'Create one softly realistic life-simulator portrait for AgeUp. Use believable anatomy, facial structure, skin, hair, proportions, and natural lighting, with smoother textures, cleaner detail, and subtle expressive warmth. It should look like a real person adapted for a polished mobile game, not an ultra-photorealistic photograph. Never use cartoon, flat illustration, anime, chibi, 3D, clay, vector, pixel art, mascot, caricature, or exaggerated features. Never copy a named game, existing character, logo, or proprietary art exactly.'
     : 'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.';
   const prompt = [
     styleDirection,
@@ -1413,7 +1413,7 @@ function portraitEditPrompt(subject, requestedChange) {
   const change = portraitSafeText(requestedChange, 320);
   if (!change) throw new Error('Describe the appearance change to make.');
   const styleDirection = subject.style === 'stylized'
-    ? 'Keep the exact friendly stylized 2D life-simulator portrait style: clean rounded shapes, crisp outlines, flat readable colors, low detail, and light soft shading. Do not turn it photorealistic, 3D, anime, chibi, or painterly, and do not copy any named game or existing character exactly.'
+    ? 'Keep the exact softly realistic life-simulator portrait style: believable anatomy, facial structure, skin, hair, proportions, natural lighting, smooth texture, clean detail, and subtle expressive warmth. Keep the subject realistic but not ultra-photographic. Never turn it into cartoon, flat illustration, anime, chibi, 3D, clay, vector, pixel art, mascot, caricature, or exaggerated art, and do not copy any named game or existing character exactly.'
     : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
   return [
     'Edit image 0 and keep it as the exact same character.',
@@ -1516,7 +1516,7 @@ async function generateCloudflarePortrait(subject) {
     {
       prompt: portraitSafeText([
         subject.style === 'stylized'
-          ? 'Polished simple 2D mobile life-sim portrait with clean shapes and friendly expression.'
+          ? 'Softly realistic mobile life-sim portrait with believable anatomy, natural lighting, smooth clean detail, and a friendly expression; realistic but not ultra-photographic.'
           : 'Lifelike realistic mobile life-sim portrait with natural anatomy and a friendly expression.',
         `Exactly one ${subject.age}-year-old ${subject.species}.`,
         subject.gender && `Gender: ${subject.gender}.`,
