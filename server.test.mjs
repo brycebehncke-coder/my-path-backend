@@ -62,16 +62,18 @@ test('portrait stages are derived from the authoritative age', () => {
   assert.equal(portraitLifeStage(65), 'elderly');
 });
 
-test('portrait generation body uses only fields accepted by the Cloudflare REST model', () => {
+test('portrait generation body uses age-sensitive Flux Klein fields', () => {
   const subject = normalizePortraitSubject({
     profile_id: 'profile-rest-contract',
     age: 28,
     species: 'person',
   });
   const body = portraitGenerationRequestBody(subject);
-  assert.deepEqual(Object.keys(body).sort(), ['prompt', 'steps']);
-  assert.equal(body.steps, 6);
-  assert.equal('seed' in body, false);
+  assert.deepEqual(Object.keys(body).sort(), ['guidance', 'height', 'prompt', 'seed', 'width']);
+  assert.equal(body.width, 512);
+  assert.equal(body.height, 512);
+  assert.equal(body.guidance, 8.5);
+  assert.equal(Number.isInteger(body.seed), true);
 });
 
 test('portrait generation prompts stay within the Cloudflare 2048-character contract', () => {
@@ -120,6 +122,28 @@ test('portrait prompts preserve young and middle-aged parent appearances', () =>
   const editedPrompt = portraitEditPrompt(youngParent, 'trim their hair');
   assert.match(editedPrompt, /unmistakably young adult/i);
   assert.match(editedPrompt, /no gray hair, deep wrinkles, age spots, sagging, jowls, or elderly features/i);
+});
+
+test('portrait prompts lock newborn age before all potentially conflicting facts', () => {
+  const newborn = normalizePortraitSubject({
+    profile_id: 'newborn-age-lock',
+    name: 'Mina',
+    gender: 'female',
+    age: 0,
+    role: 'retired mother',
+    species: 'human',
+    occupation: 'grandmother',
+    subject_description: 'Her elderly mother stands beside the crib.',
+    visual_identity: 'an old woman with gray hair and wrinkles',
+  });
+  const prompt = portraitGenerationPrompt(newborn);
+  assert.match(prompt, /^AGE 0 NEWBORN LOCK:/);
+  assert.match(prompt, /under one month old/i);
+  assert.match(prompt, /sparse fine baby hair/i);
+  assert.match(prompt, /cannot sit, stand/i);
+  assert.match(prompt, /highest-priority visual fact/i);
+  assert.match(prompt, /never substitute or include a parent, caretaker, relative/i);
+  assert.doesNotMatch(prompt, /elderly mother stands beside the crib/i);
 });
 
 test('portrait prompts request normal slightly happy and rested expressions', () => {
@@ -220,7 +244,7 @@ test('portrait subjects preserve unusual custom-life species without accepting p
 });
 
 test('portrait list-price estimates distinguish generation from editing', () => {
-  assert.equal(portraitEstimatedCostUSD('generation'), 0.0006336);
+  assert.equal(portraitEstimatedCostUSD('generation'), 0.000287);
   assert.equal(portraitEstimatedCostUSD('edit'), 0.000346);
 });
 

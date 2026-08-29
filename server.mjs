@@ -12,14 +12,14 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v9-soft-realistic-exact-age';
+const backendRevision = 'generated-character-portraits-v10-age-locked-klein-generation';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
 const cloudflareApiToken = (process.env.CLOUDFLARE_API_TOKEN || '').trim();
-const portraitGenerationModel = '@cf/black-forest-labs/flux-1-schnell';
+const portraitGenerationModel = '@cf/black-forest-labs/flux-2-klein-4b';
 const portraitEditingModel = '@cf/black-forest-labs/flux-2-klein-4b';
-const portraitGenerationEstimatedCostUSD = 0.0006336;
+const portraitGenerationEstimatedCostUSD = 0.000287;
 const portraitEditingEstimatedCostUSD = 0.000346;
 const portraitRequestMaximumPerPlayerPerDay = configuredPositiveInteger(
   process.env.PORTRAIT_REQUEST_MAX_PER_PLAYER_PER_DAY,
@@ -1354,7 +1354,7 @@ function portraitEstimatedCostUSD(operation) {
 function portraitAgeAppearanceDirective(subject) {
   const age = Math.max(0, Number(subject.age) || 0);
   if (age === 0) {
-    return 'Age appearance lock: render an unmistakable newborn infant, never an older baby, child, teen, or adult.';
+    return 'AGE 0 NEWBORN LOCK: render an unmistakable newborn infant under one month old with newborn head-to-body proportions, a very small body, soft round newborn features, sparse fine baby hair, and age-appropriate swaddling or infant clothing. The newborn cannot sit, stand, pose like an older child, wear makeup or jewelry, have an adult hairstyle, or look like a toddler, child, teen, adult, or elderly person.';
   }
   if (age <= 3) {
     return `Age appearance lock: render an unmistakable ${age}-year-old toddler, never an older child, teen, or adult.`;
@@ -1389,18 +1389,19 @@ function portraitGenerationPrompt(subject) {
     subject.visualIdentity && `authoritative individual identity: ${portraitSafeText(subject.visualIdentity, 88)}`,
     subject.familyIdentity && `biological family inheritance: ${portraitSafeText(subject.familyIdentity, 88)}`,
     subject.appearanceDescription && `appearance: ${portraitSafeText(subject.appearanceDescription, 180)}`,
-    subject.subjectDescription && `life details: ${portraitSafeText(subject.subjectDescription, 140)}`,
   ].filter(Boolean).join('; ');
   const styleDirection = subject.style === 'stylized'
     ? 'Create one softly realistic life-simulator portrait for AgeUp. Use believable anatomy, facial structure, skin, hair, proportions, and natural lighting, with smoother textures, cleaner detail, and subtle expressive warmth. It should look like a real person adapted for a polished mobile game, not an ultra-photorealistic photograph. Never use cartoon, flat illustration, anime, chibi, 3D, clay, vector, pixel art, mascot, caricature, or exaggerated features. Never copy a named game, existing character, logo, or proprietary art exactly.'
     : 'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.';
   const prompt = [
+    portraitAgeAppearanceDirective(subject),
+    'The exact chronological age is the highest-priority visual fact. It overrides any conflicting age implied by the role, occupation, appearance, individual identity, family identity, setting, narrative, or other field.',
+    'Portray only the exact named subject. Never substitute or include a parent, caretaker, relative, spouse, coworker, or any other person mentioned by surrounding life context.',
     styleDirection,
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
     'Respect the exact species or breed. Real animals keep normal breed anatomy and posture; quadrupeds stay quadrupedal. Never give animals human faces, skin, hair, hands, torsos, clothing, upright posture, hybrid anatomy, or anthropomorphism unless explicitly requested.',
     'Give the subject a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when their anatomy allows it, and a healthy rested appearance. Never make them look sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless an explicit immutable life fact requires that exact appearance.',
     `${facts}.`,
-    portraitAgeAppearanceDirective(subject),
     'Identity and family inheritance are binding. Preserve this character across ages. Relatives share inherited traits; do not change ancestry or complexion without an explicit life fact.',
     'Show exactly one subject, centered and forward-facing, in professional head-and-upper-body framing against a quiet neutral background.',
     'Respect culture, clothing, and era.',
@@ -1416,10 +1417,11 @@ function portraitEditPrompt(subject, requestedChange) {
     ? 'Keep the exact softly realistic life-simulator portrait style: believable anatomy, facial structure, skin, hair, proportions, natural lighting, smooth texture, clean detail, and subtle expressive warmth. Keep the subject realistic but not ultra-photographic. Never turn it into cartoon, flat illustration, anime, chibi, 3D, clay, vector, pixel art, mascot, caricature, or exaggerated art, and do not copy any named game or existing character exactly.'
     : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
   return [
+    portraitAgeAppearanceDirective(subject),
+    `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
+    'The exact chronological age is the highest-priority visual fact. If image 0 looks older or younger, correct it completely rather than preserving that incorrect apparent age.',
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
-    `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
-    portraitAgeAppearanceDirective(subject),
     subject.visualIdentity && `Preserve this character identity: ${portraitSafeText(subject.visualIdentity, 180)}.`,
     subject.familyIdentity && `Preserve these inherited family traits: ${portraitSafeText(subject.familyIdentity, 180)}.`,
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
@@ -1446,7 +1448,7 @@ function decodedPortraitReferenceImage(rawValue) {
 
 function portraitSeed(subject, suffix = '') {
   return createHash('sha256')
-    .update(`${subject.profileId}\0${subject.style}\0${subject.lifeStage}\0${subject.revision}\0${suffix}`)
+    .update(`${subject.profileId}\0${subject.style}\0${subject.lifeStage}\0${subject.age}\0${subject.revision}\0${suffix}`)
     .digest()
     .readUInt32BE(0) & 0x7fffffff;
 }
@@ -1502,19 +1504,39 @@ async function cloudflarePortraitImage(response) {
   return { image, mimeType: 'image/jpeg' };
 }
 
-function portraitGenerationRequestBody(subject) {
+function portraitGenerationRequestBody(
+  subject,
+  prompt = portraitGenerationPrompt(subject),
+  seedSuffix = 'generation',
+) {
   return {
-    prompt: portraitGenerationPrompt(subject),
-    steps: 6,
+    prompt,
+    width: 512,
+    height: 512,
+    guidance: 8.5,
+    seed: portraitSeed(subject, seedSuffix),
   };
+}
+
+function portraitGenerationFormData(body) {
+  const form = new FormData();
+  form.append('prompt', body.prompt);
+  form.append('width', String(body.width));
+  form.append('height', String(body.height));
+  form.append('guidance', String(body.guidance));
+  form.append('seed', String(body.seed));
+  return form;
 }
 
 async function generateCloudflarePortrait(subject) {
   let lastError;
   const requestBodies = [
     portraitGenerationRequestBody(subject),
-    {
-      prompt: portraitSafeText([
+    portraitGenerationRequestBody(
+      subject,
+      portraitSafeText([
+        portraitAgeAppearanceDirective(subject),
+        'The exact chronological age is the highest-priority visual fact and overrides every conflicting detail.',
         subject.style === 'stylized'
           ? 'Softly realistic mobile life-sim portrait with believable anatomy, natural lighting, smooth clean detail, and a friendly expression; realistic but not ultra-photographic.'
           : 'Lifelike realistic mobile life-sim portrait with natural anatomy and a friendly expression.',
@@ -1523,8 +1545,8 @@ async function generateCloudflarePortrait(subject) {
         subject.visualIdentity && `Identity: ${subject.visualIdentity}.`,
         'Centered, forward-facing, quiet background, no text, no extra subjects, no hybrid anatomy.',
       ].filter(Boolean).join(' '), portraitGenerationPromptMaximumLength),
-      steps: 6,
-    },
+      'generation-fallback',
+    ),
   ];
   for (const body of requestBodies) {
     try {
@@ -1532,10 +1554,9 @@ async function generateCloudflarePortrait(subject) {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${cloudflareApiToken}`,
-          'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify(body),
+        body: portraitGenerationFormData(body),
       });
       return await cloudflarePortraitImage(response);
     } catch (error) {
@@ -1550,6 +1571,7 @@ async function editCloudflarePortrait(subject, requestedChange, referenceImage) 
   form.append('prompt', portraitEditPrompt(subject, requestedChange));
   form.append('width', '512');
   form.append('height', '512');
+  form.append('guidance', '8.5');
   form.append('seed', String(portraitSeed(subject, requestedChange)));
   form.append('input_image_0', new Blob([referenceImage], { type: 'image/jpeg' }), 'portrait.jpg');
   const response = await fetch(cloudflarePortraitURL(portraitEditingModel), {
