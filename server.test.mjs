@@ -38,6 +38,7 @@ import {
   playerQuotaReceipt,
   playIntegrityRequestHash,
   portraitEditPrompt,
+  portraitGenerationFantasySafetyPrompt,
   portraitGenerationPrompt,
   portraitGenerationRequestBody,
   portraitLifeStage,
@@ -95,8 +96,10 @@ test('portrait generation prompts stay within the Cloudflare 2048-character cont
   const prompt = portraitGenerationPrompt(subject);
   assert.ok(prompt.length <= 2_000, `prompt was ${prompt.length} characters`);
   assert.match(prompt, /exact chronological age: 29 years old/i);
+  assert.match(prompt, /authoritative individual identity:/i);
+  assert.match(prompt, /binding biological family inheritance:/i);
   assert.match(prompt, /unmistakably young adult/i);
-  assert.match(prompt, /quadrupeds stay quadrupedal/i);
+  assert.match(prompt, /real animals keep normal breed anatomy/i);
   assert.match(prompt, /no words, labels, logos/i);
 });
 
@@ -142,7 +145,7 @@ test('portrait prompts lock newborn age before all potentially conflicting facts
   assert.match(prompt, /sparse fine baby hair/i);
   assert.match(prompt, /cannot sit, stand/i);
   assert.match(prompt, /highest-priority visual fact/i);
-  assert.match(prompt, /never substitute or include a parent, caretaker, relative/i);
+  assert.match(prompt, /never substitute or add a parent, caretaker, relative/i);
   assert.doesNotMatch(prompt, /elderly mother stands beside the crib/i);
 });
 
@@ -180,12 +183,12 @@ test('portrait style is explicit and changes the generation contract', () => {
   assert.equal(realistic.style, 'realistic');
   assert.equal(stylized.style, 'stylized');
   assert.match(portraitGenerationPrompt(realistic), /highly realistic lifelike portrait/i);
-  assert.match(portraitGenerationPrompt(stylized), /softly realistic life-simulator portrait/i);
-  assert.match(portraitGenerationPrompt(stylized), /not an ultra-photorealistic photograph/i);
-  assert.match(portraitGenerationPrompt(stylized), /never use cartoon, flat illustration/i);
-  assert.match(portraitGenerationPrompt(stylized), /never copy a named game/i);
+  assert.match(portraitGenerationPrompt(stylized), /semi-realistic digital life-simulator portrait/i);
+  assert.match(portraitGenerationPrompt(stylized), /softly illustrated rather than photographed/i);
+  assert.match(portraitGenerationPrompt(stylized), /never make it ultra-photorealistic, camera-like/i);
+  assert.match(portraitGenerationPrompt(stylized), /imitation of a named game or character/i);
   assert.doesNotMatch(portraitGenerationPrompt(stylized), /highly realistic lifelike portrait/i);
-  assert.match(portraitEditPrompt(stylized, 'add a hat'), /keep the exact softly realistic life-simulator portrait style/i);
+  assert.match(portraitEditPrompt(stylized, 'add a hat'), /keep the exact polished semi-realistic digital life-simulator portrait style/i);
 });
 
 test('portrait prompts preserve the exact character and biological family identity', () => {
@@ -205,7 +208,7 @@ test('portrait prompts preserve the exact character and biological family identi
   assert.match(prompt, /authoritative individual identity: warm deep-brown skin/i);
   assert.match(prompt, /biological family inheritance: Nigerian family/i);
   assert.match(prompt, /occupation: student/i);
-  assert.match(prompt, /do not change ancestry or complexion/i);
+  assert.match(prompt, /never change the stated complexion, ancestry/i);
 });
 
 test('portrait subjects preserve unusual custom-life species without accepting prompt-sized fields', () => {
@@ -228,19 +231,39 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.equal(subject.revision, 2);
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
-  assert.match(prompt, /exactly one subject/i);
+  assert.match(prompt, /exactly one centered, forward-facing subject/i);
   assert.match(prompt, /highly realistic lifelike portrait/i);
   assert.match(prompt, /exact chronological age: 9 years old/i);
   assert.match(prompt, /photographic anatomy/i);
   assert.match(prompt, /exact species or breed/i);
   assert.match(prompt, /real animals keep normal breed anatomy/i);
-  assert.match(prompt, /never give animals human faces/i);
-  assert.match(prompt, /anthropomorphism unless explicitly requested/i);
+  assert.match(prompt, /never humanize an animal unless explicitly requested/i);
   assert.match(prompt, /never use cartoon, flat or simple illustration/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
   );
+});
+
+test('portrait fantasy safety fallback keeps age and visual identity without a filtered species label', () => {
+  const subject = normalizePortraitSubject({
+    profile_id: 'young-fantasy-profile',
+    name: 'Gor Ashfang',
+    gender: 'male',
+    age: 10,
+    role: 'player',
+    species: 'orc',
+    style: 'stylized',
+    visual_identity: 'moss-green skin, amber eyes, and short black hair',
+    family_identity: 'moss-green skin and amber eyes run in the Ashfang family',
+  });
+  const prompt = portraitGenerationFantasySafetyPrompt(subject);
+  assert.match(prompt, /exactly 10 years old/i);
+  assert.match(prompt, /moss-green skin, amber eyes/i);
+  assert.match(prompt, /binding inherited traits/i);
+  assert.match(prompt, /softly illustrated rather than photographed/i);
+  assert.doesNotMatch(prompt, /orc/i);
+  assert.match(prompt, /no weapons, violence, injury/i);
 });
 
 test('portrait list-price estimates distinguish generation from editing', () => {
