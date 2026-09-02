@@ -16,6 +16,7 @@ import {
   normalizeCreatorCode,
   parseCreatorCodeCatalog,
   resolveCreatorCode,
+  deepSeekJSONInstructionForBody,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
   forwardedChatBody,
@@ -31,6 +32,8 @@ import {
   isGPT5MiniCustomBirthDossierRequest,
   mergedUsage,
   normalizeAIContentReport,
+  openAICreditBalanceIsExhausted,
+  openAICreditFallbackBody,
   normalizePortraitSubject,
   normalizeModelName,
   normalizePlayerIdentifier,
@@ -482,6 +485,44 @@ test('adapts strict schema requests for the direct DeepSeek API', () => {
   assert.match(forwarded.messages[0].content, /"narration"/);
 });
 
+test('does not duplicate the embedded Custom Life schema for DeepSeek', () => {
+  const request = {
+    model: 'deepseek-v4-pro',
+    messages: [
+      {
+        role: 'system',
+        content: 'The complete compact Custom Life shape is already defined here.',
+      },
+      { role: 'user', content: 'I want to be born in Troy in 1980.' },
+    ],
+    prompt_cache_key: 'my-path-open-custom-birth-v3',
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'gpt5_open_custom_birth_launch_v2',
+        strict: true,
+        schema: {
+          type: 'object',
+          properties: {
+            duplicated_schema_marker: { type: 'string' },
+          },
+          required: ['duplicated_schema_marker'],
+          additionalProperties: false,
+        },
+      },
+    },
+  };
+
+  const instruction = deepSeekJSONInstructionForBody(request);
+  const forwarded = forwardedChatBody(request, routeForModel('deepseek-v4-pro'));
+
+  assert.match(instruction, /system message already defines the required object shape/i);
+  assert.doesNotMatch(instruction, /duplicated_schema_marker/);
+  assert.deepEqual(forwarded.response_format, { type: 'json_object' });
+  assert.match(forwarded.messages[0].content, /complete compact Custom Life shape/);
+  assert.doesNotMatch(forwarded.messages[0].content, /duplicated_schema_marker/);
+});
+
 test('leaves the existing GPT request format intact', () => {
   const body = {
     model: 'gpt-4o-mini',
@@ -599,6 +640,7 @@ test('recognizes only GPT-5 mini birth narration requests for empty-output recov
     'gpt5_standard_birth_launch_v2',
     'gpt5_standard_birth_launch_v3',
     'gpt5_standard_birth_launch_v4',
+    'gpt5_standard_birth_launch_v5',
   ]) {
     assert.equal(isGPT5MiniBirthNarrationRequest({
       model: 'gpt-5-mini',
@@ -651,6 +693,8 @@ test('recognizes the compact GPT-5 custom birth launch schema', () => {
     'gpt5_custom_birth_launch_v3',
     'gpt5_custom_birth_launch_v4',
     'gpt5_custom_birth_launch_v5',
+    'gpt5_custom_birth_launch_v6',
+    'gpt5_open_custom_birth_launch_v2',
     'gpt5_open_custom_takeover_launch_v5',
   ]) {
     assert.equal(isGPT5MiniCustomBirthDossierRequest({
@@ -681,6 +725,8 @@ test('recognizes the compact GPT-5 custom birth launch schema', () => {
   }), true);
   for (const promptCacheKey of [
     'my-path-open-custom-birth-v2',
+    'my-path-open-custom-birth-v3',
+    'my-path-gpt5-custom-birth-open-v3',
     'my-path-open-custom-takeover-v4',
     'my-path-open-custom-takeover-v6',
   ]) {
@@ -695,6 +741,67 @@ test('recognizes the compact GPT-5 custom birth launch schema', () => {
       'low',
     );
   }
+});
+
+test('falls back only for an explicit exhausted OpenAI credit balance', () => {
+  const openAIRoute = routeForModel('gpt-5-mini');
+  assert.equal(openAICreditBalanceIsExhausted({
+    ok: false,
+    payload: {
+      error: {
+        type: 'insufficient_quota',
+        code: 'credit_balance_exhausted',
+      },
+    },
+  }, openAIRoute), true);
+  assert.equal(openAICreditBalanceIsExhausted({
+    ok: false,
+    payload: {
+      error: {
+        type: 'invalid_request_error',
+        code: 'invalid_request_error',
+      },
+    },
+  }, openAIRoute), false);
+  assert.equal(openAICreditBalanceIsExhausted({
+    ok: false,
+    payload: {
+      error: {
+        type: 'insufficient_quota',
+        code: 'credit_balance_exhausted',
+      },
+    },
+  }, routeForModel('deepseek-v4-pro')), false);
+});
+
+test('gives the Custom Life credit fallback enough room to finish once', () => {
+  const fallbackRoute = routeForModel('deepseek-v4-pro');
+  const customRequest = {
+    model: 'gpt-5-mini',
+    max_tokens: 1_200,
+    prompt_cache_key: 'my-path-open-custom-birth-v3',
+    response_format: {
+      type: 'json_schema',
+      json_schema: {
+        name: 'gpt5_open_custom_birth_launch_v2',
+        schema: { type: 'object' },
+      },
+    },
+  };
+  const ordinaryRequest = {
+    model: 'gpt-5-mini',
+    max_tokens: 600,
+    prompt_cache_key: 'ordinary-request',
+  };
+
+  const customFallback = openAICreditFallbackBody(customRequest, fallbackRoute);
+  const ordinaryFallback = openAICreditFallbackBody(ordinaryRequest, fallbackRoute);
+
+  assert.equal(customFallback.model, 'deepseek-v4-pro');
+  assert.equal(customFallback.max_tokens, 1_800);
+  assert.equal('max_completion_tokens' in customFallback, false);
+  assert.equal(ordinaryFallback.model, 'deepseek-v4-pro');
+  assert.equal(ordinaryFallback.max_tokens, 600);
 });
 
 test('retries an empty length-limited GPT-5 custom dossier with a larger budget', () => {

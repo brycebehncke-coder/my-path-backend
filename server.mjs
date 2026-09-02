@@ -1715,6 +1715,37 @@ function deepSeekJSONInstruction(responseFormat) {
   return '';
 }
 
+function deepSeekRequestUsesEmbeddedCustomBirthSchema(body) {
+  const promptCacheKey = String(body?.prompt_cache_key || '').trim();
+  const schemaName = String(body?.response_format?.json_schema?.name || '').trim();
+  return promptCacheKey === 'my-path-open-custom-birth-v3'
+    || promptCacheKey === 'my-path-gpt5-custom-birth-open-v3'
+    || schemaName === 'gpt5_open_custom_birth_launch_v2';
+}
+
+function deepSeekJSONInstructionForBody(body) {
+  if (deepSeekRequestUsesEmbeddedCustomBirthSchema(body)) {
+    return 'Return only one complete, minified, valid JSON object with no markdown or commentary. The system message already defines the required object shape. Keep metadata compact and finish the object before the token limit.';
+  }
+  return deepSeekJSONInstruction(body?.response_format);
+}
+
+function openAICreditFallbackBody(body, fallbackRoute) {
+  const fallbackBody = {
+    ...body,
+    model: fallbackRoute.upstreamModel,
+  };
+  if (deepSeekRequestUsesEmbeddedCustomBirthSchema(body)) {
+    const requestedBudget = Number(body?.max_tokens ?? body?.max_completion_tokens ?? 0);
+    // 1,200 tokens repeatedly ended mid-object and caused a second full
+    // DeepSeek generation. A larger ceiling lets the same compact dossier stop
+    // naturally; in live timing it completed sooner and used fewer total tokens.
+    fallbackBody.max_tokens = Math.max(1_800, requestedBudget || 0);
+    delete fallbackBody.max_completion_tokens;
+  }
+  return fallbackBody;
+}
+
 function forwardedChatBody(body, route) {
   const forwarded = {
     ...body,
@@ -1750,7 +1781,11 @@ function forwardedChatBody(body, route) {
     delete forwarded.reasoning_effort;
     forwarded.thinking = { type: 'disabled' };
 
-    const jsonInstruction = deepSeekJSONInstruction(body.response_format);
+    // Current Custom Life prompts already contain their complete compact shape.
+    // Serializing the same large schema into the prompt a second time made the
+    // emergency DeepSeek fallback hit its output limit and start another full
+    // generation after the app's loading deadline.
+    const jsonInstruction = deepSeekJSONInstructionForBody(body);
     if (jsonInstruction) {
       forwarded.messages = appendSystemInstruction(body.messages, jsonInstruction);
       forwarded.response_format = { type: 'json_object' };
@@ -1798,9 +1833,61 @@ function deepSeekResponseNeedsRetry(payload, forwardedBody) {
   }
 }
 
+function customBirthFallbackShape(payload) {
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    return { content_type: typeof content, content_characters: 0 };
+  }
+  try {
+    const root = JSON.parse(content);
+    const player = root?.p && typeof root.p === 'object' ? root.p : {};
+    const story = typeof root?.story === 'string'
+      ? root.story
+      : (typeof root?.narration === 'string' ? root.narration : '');
+    const playerName = String(player.name || player.full_name || '').trim();
+    const playerCity = String(player.city || player.birth_city || '').trim();
+    const playerCountry = String(player.country || player.birth_country_name || '').trim();
+    const parents = Array.isArray(root?.parents) ? root.parents : [];
+    const relationships = Array.isArray(root?.relationships) ? root.relationships : [];
+    return {
+      top_level_keys: Object.keys(root).sort(),
+      player_keys: Object.keys(player).sort(),
+      player_name: playerName,
+      player_city: playerCity,
+      player_country: playerCountry,
+      player_birth_place: String(player.birthPlace || player.birth_place || '').trim(),
+      parent_summaries: parents.map((parent) => ({
+        name: String(parent?.name || parent?.full_name || '').trim(),
+        relation: String(parent?.relation || parent?.role || '').trim(),
+        gender: String(parent?.gender || '').trim(),
+        age: Number(parent?.age ?? -1),
+      })),
+      relationship_records: relationships.length,
+      named_relationship_records: relationships.filter(
+        (relationship) => String(relationship?.name || relationship?.full_name || '').trim(),
+      ).length,
+      section_types: Object.fromEntries(
+        ['siblings', 'pets', 'relationships', 'assets', 'bio', 'truths', 'facts', 'plan']
+          .map((key) => [key, Array.isArray(root?.[key]) ? 'array' : typeof root?.[key]]),
+      ),
+      story_characters: story.length,
+      story_has_player_name: Boolean(playerName && story.toLowerCase().includes(playerName.toLowerCase())),
+      story_has_player_city: Boolean(playerCity && story.toLowerCase().includes(playerCity.toLowerCase())),
+      story_has_player_country: Boolean(playerCountry && story.toLowerCase().includes(playerCountry.toLowerCase())),
+      finish_reason: payload?.choices?.[0]?.finish_reason || null,
+      completion_tokens: Number(payload?.usage?.completion_tokens || 0),
+    };
+  } catch {
+    return { content_type: 'invalid_json', content_characters: content.trim().length };
+  }
+}
+
 function isGPT5MiniBirthNarrationRequest(body) {
   const promptCacheKey = String(body?.prompt_cache_key || '').trim();
-  if (promptCacheKey === 'my-path-gpt5-birth-narration-plain-v1') {
+  if (
+    promptCacheKey === 'my-path-gpt5-birth-narration-plain-v1'
+    || promptCacheKey === 'my-path-gpt5-standard-birth-v58'
+  ) {
     return true;
   }
   const responseFormat = body?.response_format;
@@ -1809,6 +1896,7 @@ function isGPT5MiniBirthNarrationRequest(body) {
     schemaName === 'gpt5_standard_birth_launch_v2'
     || schemaName === 'gpt5_standard_birth_launch_v3'
     || schemaName === 'gpt5_standard_birth_launch_v4'
+    || schemaName === 'gpt5_standard_birth_launch_v5'
   ) {
     return true;
   }
@@ -1853,6 +1941,8 @@ function isGPT5MiniCustomBirthDossierRequest(body) {
     || promptCacheKey === 'my-path-open-custom-takeover-v5'
     || promptCacheKey === 'my-path-open-custom-takeover-v6'
     || promptCacheKey === 'my-path-open-custom-birth-v2'
+    || promptCacheKey === 'my-path-open-custom-birth-v3'
+    || promptCacheKey === 'my-path-gpt5-custom-birth-open-v3'
   ) {
     return true;
   }
@@ -1862,8 +1952,21 @@ function isGPT5MiniCustomBirthDossierRequest(body) {
     || schemaName === 'gpt5_custom_birth_launch_v3'
     || schemaName === 'gpt5_custom_birth_launch_v4'
     || schemaName === 'gpt5_custom_birth_launch_v5'
+    || schemaName === 'gpt5_custom_birth_launch_v6'
+    || schemaName === 'gpt5_open_custom_birth_launch_v2'
     || schemaName === 'gpt5_open_custom_takeover_launch_v4'
     || schemaName === 'gpt5_open_custom_takeover_launch_v5';
+}
+
+function openAICreditBalanceIsExhausted(result, route) {
+  if (route?.provider !== 'OpenAI' || result?.ok) {
+    return false;
+  }
+  const error = result?.payload?.error;
+  const code = String(error?.code || '').trim().toLowerCase();
+  const type = String(error?.type || '').trim().toLowerCase();
+  return code === 'credit_balance_exhausted'
+    || (type === 'insufficient_quota' && code === 'insufficient_quota');
 }
 
 function gpt5MiniCustomBirthResponseNeedsRetry(payload, forwardedBody) {
@@ -2039,6 +2142,30 @@ async function proxyChatCompletion(body, route) {
     });
   }
   if (!first.ok) {
+    const fallbackRoute = routeForModel('deepseek-v4-pro');
+    if (
+      openAICreditBalanceIsExhausted(first, route)
+      && fallbackRoute?.apiKey
+    ) {
+      const fallback = await proxyChatCompletion(
+        openAICreditFallbackBody(body, fallbackRoute),
+        fallbackRoute,
+      );
+      fallback.billingRoute = fallbackRoute;
+      fallback.requestedModelOverride = route.upstreamModel;
+      fallback.fallbackReason = 'provider_credit_exhausted';
+      if (port === 39005) {
+        console.warn('OPENAI_CREDIT_FALLBACK', {
+          requested_model: route.upstreamModel,
+          fallback_model: fallbackRoute.upstreamModel,
+          ok: fallback.ok,
+        });
+        if (customBirthRequest) {
+          console.info('CUSTOM_BIRTH_FALLBACK_SHAPE', customBirthFallbackShape(fallback.payload));
+        }
+      }
+      return fallback;
+    }
     return first;
   }
 
@@ -2635,9 +2762,18 @@ const server = createServer(async (req, res) => {
       }
 
       if (result.payload?.usage) {
-        attachPricingMetadata(result.payload, route, quotaAt);
+        attachPricingMetadata(result.payload, result.billingRoute || route, quotaAt);
       }
-      const actualTokens = actualChatWalletTokens(result.payload, route, quotaAt);
+      if (result.requestedModelOverride && result.payload && typeof result.payload === 'object') {
+        result.payload.requested_model = result.requestedModelOverride;
+        result.payload.actual_model = (result.billingRoute || route).upstreamModel;
+        result.payload.fallback_reason = result.fallbackReason;
+      }
+      const actualTokens = actualChatWalletTokens(
+        result.payload,
+        result.billingRoute || route,
+        quotaAt,
+      );
       const quotaSnapshot = ledger.reconcile(
         quotaReservation.reservation,
         actualTokens,
@@ -2692,6 +2828,7 @@ export {
   attachPricingMetadata,
   creatorCodeInteger,
   creatorCodeRequestIsRateLimited,
+  deepSeekJSONInstructionForBody,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
   gpt5MiniBirthResponseNeedsRetry,
@@ -2706,6 +2843,8 @@ export {
   forwardedChatBody,
   mergedUsage,
   normalizeAIContentReport,
+  openAICreditBalanceIsExhausted,
+  openAICreditFallbackBody,
   normalizePortraitSubject,
   modelRoutes,
   normalizePlayerIdentifier,
