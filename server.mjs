@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v11-identity-first-fantasy-fallback';
+const backendRevision = 'generated-character-portraits-v12-deduplicated-deadline';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -21,6 +21,10 @@ const portraitGenerationModel = '@cf/black-forest-labs/flux-2-klein-4b';
 const portraitEditingModel = '@cf/black-forest-labs/flux-2-klein-4b';
 const portraitGenerationEstimatedCostUSD = 0.000287;
 const portraitEditingEstimatedCostUSD = 0.000346;
+const portraitProviderDeadlineMs = 45_000;
+const portraitResponseCacheTTLms = 120_000;
+const portraitResponseCacheMaximumEntries = 32;
+const portraitMaximumInFlightRequests = 32;
 const portraitRequestMaximumPerPlayerPerDay = configuredPositiveInteger(
   process.env.PORTRAIT_REQUEST_MAX_PER_PLAYER_PER_DAY,
   200,
@@ -1494,15 +1498,122 @@ function portraitRequestIsAllowed(playerHash, at = new Date()) {
   return true;
 }
 
+class PortraitRequestError extends Error {
+  constructor(code, message, statusCode) {
+    super(message);
+    this.code = code;
+    this.statusCode = statusCode;
+  }
+}
+
+function portraitRequestKey(playerHash, subject, operation, requestedChange = '', referenceImage = null) {
+  const referenceHash = referenceImage
+    ? createHash('sha256').update(referenceImage).digest('hex')
+    : '';
+  return createHash('sha256')
+    .update(JSON.stringify([playerHash, subject, operation, requestedChange, referenceHash]))
+    .digest('hex');
+}
+
+class PortraitRequestCoordinator {
+  constructor(now = Date.now) {
+    this.now = now;
+    this.completed = new Map();
+    this.inFlight = new Map();
+  }
+
+  async run(key, createResponse, consumeQuota) {
+    const now = this.now();
+    for (const [cachedKey, entry] of this.completed) {
+      if (entry.expiresAt <= now) this.completed.delete(cachedKey);
+    }
+    const cached = this.completed.get(key);
+    if (cached) return { ...cached.response, estimated_cost_usd: 0 };
+    const pending = this.inFlight.get(key);
+    if (pending) return { ...await pending, estimated_cost_usd: 0 };
+    if (this.inFlight.size >= portraitMaximumInFlightRequests) {
+      throw new PortraitRequestError(
+        'portrait_capacity',
+        'Character portraits are busy. Please try again shortly.',
+        503,
+      );
+    }
+    if (!consumeQuota()) {
+      throw new PortraitRequestError(
+        'portrait_daily_limit',
+        'This player has reached today\'s character portrait limit.',
+        429,
+      );
+    }
+
+    // Reserve the key before starting provider work, so only its owner uses quota.
+    const request = Promise.resolve().then(createResponse);
+    this.inFlight.set(key, request);
+    try {
+      const response = await request;
+      this.completed.set(key, {
+        response,
+        expiresAt: this.now() + portraitResponseCacheTTLms,
+      });
+      while (this.completed.size > portraitResponseCacheMaximumEntries) {
+        this.completed.delete(this.completed.keys().next().value);
+      }
+      return response;
+    } finally {
+      this.inFlight.delete(key);
+    }
+  }
+}
+
+const portraitRequests = new PortraitRequestCoordinator();
+
+async function withPortraitProviderDeadline(request) {
+  const controller = new AbortController();
+  const error = new Error('The portrait provider request timed out.');
+  error.name = 'TimeoutError';
+  let timer;
+  const deadline = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort(error);
+      reject(error);
+    }, portraitProviderDeadlineMs);
+  });
+  try {
+    // Also bound providers or body readers that fail to settle on abort.
+    return await Promise.race([request(controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function cloudflarePortraitPromptWasRejected(status, payload) {
+  if (![200, 400, 422].includes(status)) return false;
+  const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+  const detail = [...errors, payload?.error, payload?.raw]
+    .filter(Boolean)
+    .map((error) => typeof error === 'string' ? error : `${error.code || ''} ${error.message || ''}`)
+    .join(' ')
+    .replace(/[_-]/g, ' ');
+  if (/auth|forbidden|permission|rate\s*limit|too many requests|quota|credit|billing|api key|access token|time[ -]?out|timed out|deadline|unavailable|overload/i.test(detail)) {
+    return false;
+  }
+  return /\b(prompt|content|safety|nsfw|moderation)\b/i.test(detail)
+    && /\b(reject(?:ed|ion)?|block(?:ed)?|filter(?:ed)?|unsafe|disallow(?:ed)?|violat(?:es?|ed|ion)|inappropriate|not allowed|too long|invalid|exceed(?:s|ed)?)\b/i.test(detail);
+}
+
 function cloudflarePortraitURL(model) {
   return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(cloudflareAccountId)}/ai/run/${model}`;
 }
 
 async function cloudflarePortraitImage(response) {
   const contentType = (response.headers.get('content-type') || '').toLowerCase();
-  if (contentType.startsWith('image/')) {
+  if (response.ok && contentType.startsWith('image/')) {
+    const image = Buffer.from(await response.arrayBuffer());
+    if (image.length < 100 || image.length > 4_000_000) {
+      throw new Error('Portrait generation returned an invalid image size.');
+    }
     return {
-      image: Buffer.from(await response.arrayBuffer()),
+      image,
       mimeType: contentType.split(';')[0] || 'image/jpeg',
     };
   }
@@ -1518,7 +1629,9 @@ async function cloudflarePortraitImage(response) {
       || payload?.error?.message
       || payload?.raw
       || `Cloudflare returned HTTP ${response.status}.`;
-    throw new Error(`Portrait generation failed: ${portraitSafeText(detail, 300)}`);
+    const error = new Error(`Portrait generation failed: ${portraitSafeText(detail, 300)}`);
+    error.portraitPromptRejected = cloudflarePortraitPromptWasRejected(response.status, payload);
+    throw error;
   }
   const encoded = payload?.result?.image || payload?.image;
   if (typeof encoded !== 'string' || !encoded.trim()) {
@@ -1583,22 +1696,28 @@ async function generateCloudflarePortrait(subject) {
       'generation-fantasy-safety-fallback',
     ));
   }
-  for (const body of requestBodies) {
-    try {
-      const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${cloudflareApiToken}`,
-          Accept: 'application/json',
-        },
-        body: portraitGenerationFormData(body),
-      });
-      return await cloudflarePortraitImage(response);
-    } catch (error) {
-      lastError = error;
+  return withPortraitProviderDeadline(async (signal) => {
+    for (const body of requestBodies) {
+      signal.throwIfAborted();
+      try {
+        const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${cloudflareApiToken}`,
+            Accept: 'application/json',
+          },
+          body: portraitGenerationFormData(body),
+          signal,
+        });
+        return await cloudflarePortraitImage(response);
+      } catch (error) {
+        signal.throwIfAborted();
+        if (!error?.portraitPromptRejected) throw error;
+        lastError = error;
+      }
     }
-  }
-  throw lastError || new Error('Portrait generation failed.');
+    throw lastError || new Error('Portrait generation failed.');
+  });
 }
 
 async function editCloudflarePortrait(subject, requestedChange, referenceImage) {
@@ -1609,15 +1728,18 @@ async function editCloudflarePortrait(subject, requestedChange, referenceImage) 
   form.append('guidance', '8.5');
   form.append('seed', String(portraitSeed(subject, requestedChange)));
   form.append('input_image_0', new Blob([referenceImage], { type: 'image/jpeg' }), 'portrait.jpg');
-  const response = await fetch(cloudflarePortraitURL(portraitEditingModel), {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${cloudflareApiToken}`,
-      Accept: 'application/json',
-    },
-    body: form,
+  return withPortraitProviderDeadline(async (signal) => {
+    const response = await fetch(cloudflarePortraitURL(portraitEditingModel), {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cloudflareApiToken}`,
+        Accept: 'application/json',
+      },
+      body: form,
+      signal,
+    });
+    return cloudflarePortraitImage(response);
   });
-  return cloudflarePortraitImage(response);
 }
 
 function sendJson(res, statusCode, payload, additionalHeaders = {}) {
@@ -1762,7 +1884,9 @@ function forwardedChatBody(body, route) {
       route,
       forwarded.reasoning_effort,
     );
-    if (isGPT5MiniBirthNarrationRequest(forwarded)) {
+    if (String(forwarded.prompt_cache_key || '').trim() === 'my-path-typed-life-montage-v2') {
+      forwarded.verbosity = 'low';
+    } else if (isGPT5MiniBirthNarrationRequest(forwarded)) {
       forwarded.verbosity = 'low';
       forwarded.messages = appendSystemInstruction(
         forwarded.messages,
@@ -2328,46 +2452,50 @@ const server = createServer(async (req, res) => {
         }, { 'Cache-Control': 'no-store' });
       }
 
-      if (!portraitRequestIsAllowed(identity.hash, at)) {
-        return sendJson(res, 429, {
+      const operation = url.pathname === '/v1/portraits/edit' ? 'edit' : 'generation';
+      let requestedChange = '';
+      let referenceImage = null;
+      try {
+        if (operation === 'edit') {
+          requestedChange = portraitSafeText(parsed.body?.requested_change, 320);
+          if (!requestedChange) throw new Error('Describe the appearance change to make.');
+          referenceImage = decodedPortraitReferenceImage(parsed.body?.reference_image_base64);
+        }
+      } catch (error) {
+        return sendJson(res, 400, {
           error: {
-            code: 'portrait_daily_limit',
-            message: 'This player has reached today\'s character portrait limit.',
+            code: 'portrait_request_invalid',
+            message: error instanceof Error ? error.message : 'Invalid portrait edit.',
           },
         }, { 'Cache-Control': 'no-store' });
       }
 
       try {
-        let result;
-        let model;
-        let operation;
-        if (url.pathname === '/v1/portraits/edit') {
-          const referenceImage = decodedPortraitReferenceImage(parsed.body?.reference_image_base64);
-          result = await editCloudflarePortrait(
-            subject,
-            parsed.body?.requested_change,
-            referenceImage,
-          );
-          model = portraitEditingModel;
-          operation = 'edit';
-        } else {
-          result = await generateCloudflarePortrait(subject);
-          model = portraitGenerationModel;
-          operation = 'generation';
-        }
-        return sendJson(res, 200, {
-          ok: true,
-          portrait_id: `${subject.profileId}:${subject.lifeStage}:${subject.revision}`,
-          profile_id: subject.profileId,
-          life_stage: subject.lifeStage,
-          revision: subject.revision,
-          model,
-          operation,
-          estimated_cost_usd: portraitEstimatedCostUSD(operation),
-          mime_type: result.mimeType,
-          image_base64: result.image.toString('base64'),
-        }, { 'Cache-Control': 'no-store' });
+        const key = portraitRequestKey(identity.hash, subject, operation, requestedChange, referenceImage);
+        const response = await portraitRequests.run(key, async () => {
+          const result = operation === 'edit'
+            ? await editCloudflarePortrait(subject, requestedChange, referenceImage)
+            : await generateCloudflarePortrait(subject);
+          return {
+            ok: true,
+            portrait_id: `${subject.profileId}:${subject.lifeStage}:${subject.revision}`,
+            profile_id: subject.profileId,
+            life_stage: subject.lifeStage,
+            revision: subject.revision,
+            model: operation === 'edit' ? portraitEditingModel : portraitGenerationModel,
+            operation,
+            estimated_cost_usd: portraitEstimatedCostUSD(operation),
+            mime_type: result.mimeType,
+            image_base64: result.image.toString('base64'),
+          };
+        }, () => portraitRequestIsAllowed(identity.hash, at));
+        return sendJson(res, 200, response, { 'Cache-Control': 'no-store' });
       } catch (error) {
+        if (error instanceof PortraitRequestError) {
+          return sendJson(res, error.statusCode, {
+            error: { code: error.code, message: error.message },
+          }, { 'Cache-Control': 'no-store' });
+        }
         console.error('Portrait provider request failed:', error instanceof Error ? error.message : error);
         return sendJson(res, 502, {
           error: {
@@ -2821,6 +2949,7 @@ export {
   AppAttestRequestError,
   PlayIntegrityRequestError,
   PlayerUsageLedger,
+  PortraitRequestCoordinator,
   actualChatWalletTokens,
   appAttestChallengeToken,
   appAttestClientData,
@@ -2831,6 +2960,8 @@ export {
   deepSeekJSONInstructionForBody,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
+  editCloudflarePortrait,
+  generateCloudflarePortrait,
   gpt5MiniBirthResponseNeedsRetry,
   gpt5MiniBirthRetryBody,
   gpt5MiniCustomBirthResponseNeedsRetry,
@@ -2857,6 +2988,7 @@ export {
   portraitGenerationRequestBody,
   portraitLifeStage,
   portraitEstimatedCostUSD,
+  portraitRequestKey,
   playerQuotaHash,
   playerQuotaReceipt,
   playerQuotaUTCDateKey,

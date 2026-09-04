@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 
 import {
   AppAttestRequestError,
   PlayIntegrityRequestError,
   PlayerUsageLedger,
+  PortraitRequestCoordinator,
   actualChatWalletTokens,
   appAttestClientData,
   appAttestIsRequired,
@@ -19,6 +21,8 @@ import {
   deepSeekJSONInstructionForBody,
   deepSeekPricingMultiplier,
   deepSeekResponseNeedsRetry,
+  editCloudflarePortrait,
+  generateCloudflarePortrait,
   forwardedChatBody,
   gpt5MiniBirthResponseNeedsRetry,
   gpt5MiniBirthRetryBody,
@@ -46,6 +50,7 @@ import {
   portraitGenerationRequestBody,
   portraitLifeStage,
   portraitEstimatedCostUSD,
+  portraitRequestKey,
   recordAIContentReport,
   routeForModel,
   validatePlayIntegrityVerdict,
@@ -55,6 +60,401 @@ import {
   verifyGenuineAppRequest,
   verifyPlayIntegrityRequest,
 } from './server.mjs';
+
+function deferredPortraitProvider() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function portraitProviderResponse(status = 200, message = '') {
+  return new Response(JSON.stringify(message
+    ? { success: false, errors: [{ message }] }
+    : { success: true, result: { image: Buffer.alloc(120, 1).toString('base64') } }), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+const flushPortraitPromises = () => new Promise((resolve) => setImmediate(resolve));
+
+test('portrait generation only falls back for explicit prompt or content rejections', async (t) => {
+  const subject = normalizePortraitSubject({ profile_id: 'fallback', age: 5, species: 'elf' });
+  for (const [status, message] of [
+    [401, 'Authentication failed: content rejected'],
+    [403, 'Forbidden: prompt rejected'],
+    [429, 'Rate limit exceeded: prompt rejected'],
+    [408, 'Request timed out'],
+    [500, 'Content rejected by unavailable service'],
+    [504, 'Gateway timeout'],
+    [400, 'Invalid width'],
+    [400, 'Prompt rejected: invalid API key'],
+    [200, 'Authentication error'],
+    [200, 'Rate limit exceeded: prompt rejected'],
+    [200, 'Prompt rejected: operation timed out'],
+  ]) {
+    await t.test(`${status} ${message}`, async (t) => {
+      const provider = t.mock.method(globalThis, 'fetch', async () => portraitProviderResponse(status, message));
+      await assert.rejects(generateCloudflarePortrait(subject));
+      assert.equal(provider.mock.callCount(), 1);
+    });
+  }
+  await t.test('network errors are not prompt rejections', async (t) => {
+    const provider = t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('fetch failed'); });
+    await assert.rejects(generateCloudflarePortrait(subject), /fetch failed/);
+    assert.equal(provider.mock.callCount(), 1);
+  });
+  await t.test('all fallback attempts share their signal and keep distinct seeds', async (t) => {
+    const provider = t.mock.method(globalThis, 'fetch', async () => (
+      provider.mock.callCount() < 2
+        ? portraitProviderResponse(400, 'The prompt was rejected by the content safety filter.')
+        : portraitProviderResponse()
+    ));
+    const result = await generateCloudflarePortrait(subject);
+    assert.equal(result.image.length, 120);
+    assert.equal(provider.mock.callCount(), 3);
+    const calls = provider.mock.calls.map((call) => call.arguments[1]);
+    assert.equal(new Set(calls.map((call) => call.signal)).size, 1);
+    assert.equal(new Set(calls.map((call) => call.body.get('seed'))).size, 3);
+  });
+  await t.test('a successful response without an image is not retried', async (t) => {
+    const provider = t.mock.method(globalThis, 'fetch', async () => new Response('{}'));
+    await assert.rejects(generateCloudflarePortrait(subject), /no image/);
+    assert.equal(provider.mock.callCount(), 1);
+  });
+  await t.test('an HTTP error with an image content type is still a failure', async (t) => {
+    const provider = t.mock.method(globalThis, 'fetch', async () => new Response(Buffer.alloc(120), {
+      status: 401,
+      headers: { 'Content-Type': 'image/jpeg' },
+    }));
+    await assert.rejects(generateCloudflarePortrait(subject));
+    assert.equal(provider.mock.callCount(), 1);
+  });
+});
+
+test('portrait generation and editing bound fetch and response reading even when abort is ignored', async (t) => {
+  const subject = normalizePortraitSubject({ profile_id: 'deadline', age: 5, species: 'elf' });
+  for (const operation of ['generation', 'edit']) {
+    for (const phase of ['fetch', 'json body', 'image body']) {
+      await t.test(`${operation}: stalled ${phase}`, async (t) => {
+        t.mock.timers.enable({ apis: ['setTimeout'] });
+        const stalled = deferredPortraitProvider();
+        const provider = t.mock.method(globalThis, 'fetch', () => {
+          if (phase === 'fetch') return stalled.promise;
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            headers: new Headers({ 'Content-Type': phase === 'image body' ? 'image/jpeg' : 'application/json' }),
+            text: () => stalled.promise,
+            arrayBuffer: () => stalled.promise,
+          });
+        });
+        const request = operation === 'generation'
+          ? generateCloudflarePortrait(subject)
+          : editCloudflarePortrait(subject, 'short hair', Buffer.alloc(120));
+        const outcome = assert.rejects(request, { name: 'TimeoutError' });
+        await flushPortraitPromises();
+        const signal = provider.mock.calls[0].arguments[1].signal;
+        t.mock.timers.tick(44_999);
+        assert.equal(signal.aborted, false);
+        t.mock.timers.tick(1);
+        await outcome;
+        assert.equal(signal.aborted, true);
+        stalled.resolve(phase === 'fetch'
+          ? portraitProviderResponse(400, 'Prompt rejected by safety filter')
+          : phase === 'image body'
+            ? Buffer.alloc(120)
+            : JSON.stringify({ success: false, errors: [{ message: 'Prompt rejected by safety filter' }] }));
+        await flushPortraitPromises();
+        assert.equal(provider.mock.callCount(), 1, 'late completion must not start a fallback');
+      });
+    }
+  }
+});
+
+test('portrait fallbacks use only the remaining shared 45-second deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const first = deferredPortraitProvider();
+  const second = deferredPortraitProvider();
+  const provider = t.mock.method(globalThis, 'fetch', () => (
+    provider.mock.callCount() === 0 ? first.promise : second.promise
+  ));
+  const subject = normalizePortraitSubject({ profile_id: 'shared-deadline', age: 5, species: 'elf' });
+  const outcome = assert.rejects(generateCloudflarePortrait(subject), { name: 'TimeoutError' });
+  t.mock.timers.tick(30_000);
+  first.resolve(portraitProviderResponse(422, 'Content rejected by safety filter'));
+  await flushPortraitPromises();
+  assert.equal(provider.mock.callCount(), 2);
+  const signals = provider.mock.calls.map((call) => call.arguments[1].signal);
+  assert.equal(signals[0], signals[1]);
+  t.mock.timers.tick(14_999);
+  assert.equal(signals[1].aborted, false);
+  t.mock.timers.tick(1);
+  await outcome;
+  assert.equal(signals[1].aborted, true);
+  second.resolve(portraitProviderResponse(400, 'Prompt rejected'));
+  await flushPortraitPromises();
+  assert.equal(provider.mock.callCount(), 2);
+});
+
+test('portrait keys include every normalized subject field, operation, change, player, and reference bytes', () => {
+  const body = {
+    profile_id: 'key-subject', age: 28, revision: 1, name: '  Alex\nExample ', gender: 'woman',
+    role: 'parent', species: 'person', location: 'Paris', era: 'modern', occupation: 'teacher',
+    subject_description: 'A close family', appearance_description: 'Short hair',
+    visual_identity: 'Brown eyes', family_identity: 'Freckles', style: 'STYLIZED',
+  };
+  const subject = normalizePortraitSubject(body);
+  const reference = Buffer.alloc(120, 1);
+  const key = portraitRequestKey('player-one', subject, 'edit', 'short hair', reference);
+  assert.equal(key.length, 64);
+  assert.equal(key, portraitRequestKey('player-one', normalizePortraitSubject({
+    ...body, name: 'Alex Example', age: '28', style: 'stylized', life_stage: 'elderly',
+  }), 'edit', 'short hair', Buffer.from(reference)));
+  for (const [field, value] of Object.entries({
+    profile_id: 'other-profile', age: 29, revision: 2, name: 'Other name', gender: 'man',
+    role: 'friend', species: 'elf', location: 'London', era: 'future', occupation: 'artist',
+    subject_description: 'Other history', appearance_description: 'Long hair',
+    visual_identity: 'Green eyes', family_identity: 'Other inherited traits', style: 'realistic',
+  })) {
+    assert.notEqual(key, portraitRequestKey('player-one', normalizePortraitSubject({ ...body, [field]: value }),
+      'edit', 'short hair', reference), field);
+  }
+  assert.notEqual(key, portraitRequestKey('player-two', subject, 'edit', 'short hair', reference));
+  assert.notEqual(key, portraitRequestKey('player-one', subject, 'generation', 'short hair', reference));
+  assert.notEqual(key, portraitRequestKey('player-one', subject, 'edit', 'blue hair', reference));
+  assert.notEqual(key, portraitRequestKey('player-one', subject, 'edit', 'short hair', Buffer.alloc(120, 2)));
+  const longIdentity = 'x'.repeat(200);
+  assert.notEqual(
+    portraitRequestKey('player-one', normalizePortraitSubject({ ...body, visual_identity: `${longIdentity}a` }), 'generation'),
+    portraitRequestKey('player-one', normalizePortraitSubject({ ...body, visual_identity: `${longIdentity}b` }), 'generation'),
+    'identity must not be reduced to the truncated provider prompt',
+  );
+});
+
+test('portrait coordinator coalesces owners, never charges duplicates, and expires successes after completion', async () => {
+  let now = 0;
+  let quota = 0;
+  let operations = 0;
+  const coordinator = new PortraitRequestCoordinator(() => now);
+  const provider = deferredPortraitProvider();
+  const createResponse = () => { operations += 1; return provider.promise; };
+  const consumeQuota = () => { quota += 1; return true; };
+  const owner = coordinator.run('one', createResponse, consumeQuota);
+  const waiter = coordinator.run('one', createResponse, consumeQuota);
+  await flushPortraitPromises();
+  assert.equal(operations, 1);
+  assert.equal(quota, 1);
+  now = 30_000;
+  provider.resolve({ ok: true, image_base64: 'same-image', estimated_cost_usd: 0.000287 });
+  assert.equal((await owner).estimated_cost_usd, 0.000287);
+  assert.equal((await waiter).estimated_cost_usd, 0);
+  assert.equal(coordinator.inFlight.size, 0);
+  now = 149_999;
+  const replay = await coordinator.run('one', createResponse, consumeQuota);
+  assert.equal(replay.image_base64, 'same-image');
+  assert.equal(replay.estimated_cost_usd, 0);
+  assert.equal(quota, 1);
+  now = 150_000;
+  assert.equal((await coordinator.run('one', createResponse, consumeQuota)).estimated_cost_usd, 0.000287);
+  assert.equal(operations, 2);
+  assert.equal(quota, 2);
+});
+
+test('portrait coordinator bounds cached and in-flight entries without evicting pending owners', async () => {
+  const coordinator = new PortraitRequestCoordinator(() => 0);
+  let quota = 0;
+  const consumeQuota = () => { quota += 1; return true; };
+  const response = { ok: true, estimated_cost_usd: 1 };
+  for (let index = 0; index < 33; index += 1) {
+    await coordinator.run(`cached-${index}`, async () => response, consumeQuota);
+  }
+  assert.equal(coordinator.completed.size, 32);
+  assert.equal(coordinator.completed.has('cached-0'), false);
+  const provider = deferredPortraitProvider();
+  const owners = Array.from({ length: 32 }, (_, index) => coordinator.run(`pending-${index}`, () => provider.promise, consumeQuota));
+  const waiter = coordinator.run('pending-0', () => assert.fail('duplicate provider call'), consumeQuota);
+  await assert.rejects(coordinator.run('overflow', () => provider.promise, consumeQuota), { code: 'portrait_capacity' });
+  assert.equal(quota, 65);
+  assert.equal((await coordinator.run('cached-32', () => assert.fail('cached provider call'), consumeQuota)).estimated_cost_usd, 0);
+  provider.resolve(response);
+  assert.equal((await waiter).estimated_cost_usd, 0);
+  assert.equal((await Promise.all(owners)).length, 32);
+  assert.equal(coordinator.inFlight.size, 0);
+  assert.equal(coordinator.completed.size, 32);
+});
+
+test('portrait coordinator clears failures for every waiter and does not cache quota failures', async () => {
+  const coordinator = new PortraitRequestCoordinator();
+  const provider = deferredPortraitProvider();
+  let quota = 0;
+  const consumeQuota = () => { quota += 1; return true; };
+  const owner = coordinator.run('failed', () => provider.promise, consumeQuota);
+  const waiter = coordinator.run('failed', () => assert.fail('duplicate provider call'), consumeQuota);
+  const outcomes = Promise.all([assert.rejects(owner, /failed provider/), assert.rejects(waiter, /failed provider/)]);
+  provider.reject(new Error('failed provider'));
+  await outcomes;
+  assert.equal(coordinator.inFlight.size, 0);
+  assert.equal(coordinator.completed.size, 0);
+  const success = await coordinator.run('failed', async () => ({ estimated_cost_usd: 1 }), consumeQuota);
+  assert.equal(success.estimated_cost_usd, 1);
+  assert.equal(quota, 2);
+  await assert.rejects(coordinator.run('limited', () => assert.fail('over quota provider call'), () => false), { code: 'portrait_daily_limit' });
+  assert.equal(coordinator.completed.has('limited'), false);
+  assert.equal(coordinator.inFlight.has('limited'), false);
+});
+
+test('portrait routes authenticate, normalize, deduplicate, and charge quota only for new operations', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'my-path-portrait-routes-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const environment = {
+    PORT: '0',
+    CLOUDFLARE_ACCOUNT_ID: 'mock-account',
+    CLOUDFLARE_API_TOKEN: 'mock-token',
+    PORTRAIT_REQUEST_MAX_PER_PLAYER_PER_DAY: '5',
+    APP_ATTEST_ENFORCEMENT: 'new-builds',
+    APP_ATTEST_REQUIRED_BUILD: '172',
+    PLAYER_USAGE_LEDGER_PATH: join(directory, 'usage.json'),
+  };
+  const previous = Object.fromEntries(Object.keys(environment).map((key) => [key, process.env[key]]));
+  let isolatedServer;
+  try {
+    Object.assign(process.env, environment);
+    ({ server: isolatedServer } = await import('./server.mjs?portrait-route-tests'));
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+  assert.equal(isolatedServer.listening, false);
+  let nextProvider = () => portraitProviderResponse();
+  const provider = t.mock.method(globalThis, 'fetch', (url, options) => {
+    assert.match(url, /^https:\/\/api.cloudflare.com\/client\/v4\/accounts\/mock-account\/ai\/run\//);
+    assert.equal(options.headers.Authorization, 'Bearer mock-token');
+    return nextProvider(options);
+  });
+  t.mock.method(console, 'error', () => {});
+  const handle = isolatedServer.listeners('request')[0];
+  const invoke = async (body, { operation = 'generate', player = 1, headers = {} } = {}) => {
+    const req = Readable.from([Buffer.from(JSON.stringify(body))]);
+    req.method = 'POST';
+    req.url = `/v1/portraits/${operation}`;
+    req.headers = {
+      host: 'localhost',
+      'x-my-path-player-id': `00000000-0000-4000-8000-${String(player).padStart(12, '0')}`,
+      'x-my-path-client-build': '1',
+      ...headers,
+    };
+    const result = {};
+    await handle(req, {
+      writeHead(status, responseHeaders) { result.status = status; result.headers = responseHeaders; },
+      end(body) { result.body = JSON.parse(body); },
+    });
+    assert.equal(result.headers['Cache-Control'], 'no-store');
+    return result;
+  };
+  const body = { profile_id: 'route-subject', age: 28, name: ' Alex  Example ', style: 'STYLIZED' };
+
+  await t.test('checks authentication before joining or replaying, and isolates players', async () => {
+    const callsBefore = provider.mock.callCount();
+    const blockedHeaders = { 'x-my-path-client-build': '172' };
+    assert.equal((await invoke(body, { headers: blockedHeaders })).status, 401);
+    assert.equal(provider.mock.callCount(), callsBefore);
+    const pending = deferredPortraitProvider();
+    nextProvider = () => pending.promise;
+    const owner = invoke(body);
+    await flushPortraitPromises();
+    const waiter = invoke({ ...body, name: 'Alex Example', age: '28', style: 'stylized' });
+    await flushPortraitPromises();
+    assert.equal((await invoke(body, { headers: blockedHeaders })).status, 401);
+    assert.equal(provider.mock.callCount(), callsBefore + 1);
+    pending.resolve(portraitProviderResponse());
+    const [owned, shared] = await Promise.all([owner, waiter]);
+    assert.equal(owned.status, 200);
+    assert.equal(shared.status, 200);
+    assert.equal(owned.body.estimated_cost_usd, portraitEstimatedCostUSD('generation'));
+    assert.equal(shared.body.estimated_cost_usd, 0);
+    assert.equal(owned.body.image_base64, shared.body.image_base64);
+    assert.equal((await invoke(body, { headers: blockedHeaders })).status, 401);
+    assert.equal((await invoke(body)).body.estimated_cost_usd, 0);
+    nextProvider = () => portraitProviderResponse();
+    assert.equal((await invoke(body, { player: 2 })).body.estimated_cost_usd, portraitEstimatedCostUSD('generation'));
+    assert.equal(provider.mock.callCount(), callsBefore + 2);
+  });
+
+  await t.test('edits coalesce normalized changes and decoded reference bytes, not distinct edits', async () => {
+    const callsBefore = provider.mock.callCount();
+    const reference = Buffer.alloc(121, 251);
+    const editBody = { ...body, reference_image_base64: reference.toString('base64'), requested_change: ' short\n hair ' };
+    const pending = deferredPortraitProvider();
+    nextProvider = () => pending.promise;
+    const owner = invoke(editBody, { operation: 'edit', player: 3 });
+    await flushPortraitPromises();
+    const waiter = invoke({ ...editBody, requested_change: 'short hair', reference_image_base64: reference.toString('base64url') }, { operation: 'edit', player: 3 });
+    await flushPortraitPromises();
+    assert.equal(provider.mock.callCount(), callsBefore + 1);
+    pending.resolve(portraitProviderResponse());
+    assert.equal((await owner).body.estimated_cost_usd, portraitEstimatedCostUSD('edit'));
+    assert.equal((await waiter).body.estimated_cost_usd, 0);
+    const replay = await invoke({ ...editBody, reference_image_base64: `data:image/jpeg;base64,${reference.toString('base64')}` }, { operation: 'edit', player: 3 });
+    assert.equal(replay.body.estimated_cost_usd, 0);
+    nextProvider = () => portraitProviderResponse();
+    for (const change of [{ requested_change: 'blue hair' }, { reference_image_base64: Buffer.alloc(121, 2).toString('base64') }]) {
+      assert.equal((await invoke({ ...editBody, ...change }, { operation: 'edit', player: 3 })).body.estimated_cost_usd, portraitEstimatedCostUSD('edit'));
+    }
+    assert.equal((await invoke(body, { player: 3 })).body.estimated_cost_usd, portraitEstimatedCostUSD('generation'));
+    assert.equal(provider.mock.callCount(), callsBefore + 4);
+  });
+
+  await t.test('duplicates replay at the daily limit, and invalid edits use no quota', async () => {
+    const callsBefore = provider.mock.callCount();
+    nextProvider = () => portraitProviderResponse();
+    assert.equal((await invoke({ ...body, requested_change: '' }, { operation: 'edit', player: 4 })).status, 400);
+    assert.equal((await invoke({ ...body, requested_change: 'short hair', reference_image_base64: 'invalid' }, { operation: 'edit', player: 4 })).status, 400);
+    for (let revision = 0; revision < 5; revision += 1) {
+      assert.equal((await invoke({ ...body, revision }, { player: 4 })).status, 200);
+      assert.equal((await invoke({ ...body, revision }, { player: 4 })).body.estimated_cost_usd, 0);
+    }
+    const limited = await invoke({ ...body, revision: 5 }, { player: 4 });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.body.error.code, 'portrait_daily_limit');
+    assert.equal((await invoke({ ...body, revision: 4 }, { player: 4 })).body.estimated_cost_usd, 0);
+    assert.equal(provider.mock.callCount(), callsBefore + 5);
+  });
+
+  await t.test('coalesced failures and timeouts are removed so a new owner can retry', async (t) => {
+    for (const timeout of [false, true]) {
+      await t.test(timeout ? 'timeout' : 'provider rejection', async (t) => {
+        if (timeout) t.mock.timers.enable({ apis: ['setTimeout'] });
+        const callsBefore = provider.mock.callCount();
+        const pending = deferredPortraitProvider();
+        nextProvider = () => pending.promise;
+        const player = timeout ? 6 : 5;
+        const owner = invoke(body, { player });
+        await flushPortraitPromises();
+        const waiter = invoke(body, { player });
+        await flushPortraitPromises();
+        assert.equal(provider.mock.callCount(), callsBefore + 1);
+        if (timeout) t.mock.timers.tick(45_000);
+        else pending.resolve(portraitProviderResponse(401, 'Unauthorized'));
+        assert.equal((await owner).status, 502);
+        assert.equal((await waiter).status, 502);
+        pending.resolve(portraitProviderResponse());
+        await flushPortraitPromises();
+        nextProvider = () => portraitProviderResponse();
+        const retried = await invoke(body, { player });
+        assert.equal(retried.status, 200);
+        assert.equal(retried.body.estimated_cost_usd, portraitEstimatedCostUSD('generation'));
+        assert.equal(provider.mock.callCount(), callsBefore + 2);
+      });
+    }
+  });
+});
 
 test('portrait stages are derived from the authoritative age', () => {
   assert.equal(portraitLifeStage(0), 'baby');
@@ -593,6 +993,35 @@ test('routes GPT-5.6 Luna directly to OpenAI without forwarding unsupported mini
   const explicitLow = forwardedChatBody({ ...body, reasoning_effort: 'low' }, route);
   assert.equal(explicitLow.reasoning_effort, 'low');
   assert.notEqual(explicitLow.reasoning_effort, 'minimal');
+});
+
+test('typed life montage requests use low OpenAI reasoning verbosity without rewriting the prompt or caller budget', () => {
+  const messages = [
+    { role: 'system', content: 'Write a typed life montage in 120-210 words, following only the requested action.' },
+    { role: 'user', content: 'I spend the next three years training to become a teacher.' },
+  ];
+  for (const model of ['gpt-5-mini', 'gpt-5.6-luna']) {
+    for (const budget of [{ max_tokens: 750 }, { max_completion_tokens: 900 }, { max_tokens: 750, max_completion_tokens: 800 }]) {
+      const request = { model, messages, prompt_cache_key: 'my-path-typed-life-montage-v2', verbosity: 'high', ...budget };
+      const original = structuredClone(request);
+      const forwarded = forwardedChatBody(request, routeForModel(model));
+      assert.equal(forwarded.verbosity, 'low');
+      assert.equal(forwarded.max_completion_tokens, budget.max_completion_tokens ?? budget.max_tokens);
+      assert.equal('max_tokens' in forwarded, false);
+      assert.equal(forwarded.prompt_cache_key, request.prompt_cache_key);
+      assert.deepEqual(forwarded.messages, messages);
+      assert.doesNotMatch(JSON.stringify(forwarded.messages), /Begin directly inside the fresh event|visible Age passage|growing taller/);
+      assert.equal(isGPT5MiniAnnualAgeRequest(forwarded), false);
+      assert.deepEqual(request, original);
+    }
+    assert.equal(forwardedChatBody({ model, messages, prompt_cache_key: 'another-key', verbosity: 'high' }, routeForModel(model)).verbosity, 'high');
+  }
+  for (const model of ['gpt-4o-mini', 'deepseek-v4-pro']) {
+    const forwarded = forwardedChatBody({ model, messages, max_tokens: 750, prompt_cache_key: 'my-path-typed-life-montage-v2' }, routeForModel(model));
+    assert.equal(forwarded.verbosity, undefined);
+    assert.equal(forwarded.max_tokens, 750);
+    assert.deepEqual(forwarded.messages, messages);
+  }
 });
 
 test('retries only empty or malformed DeepSeek JSON and combines usage', () => {
