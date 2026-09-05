@@ -1357,6 +1357,10 @@ function portraitEstimatedCostUSD(operation) {
 
 function portraitAgeAppearanceDirective(subject) {
   const age = Math.max(0, Number(subject.age) || 0);
+  const species = portraitSafeText(subject.species, 100).toLowerCase();
+  if (species && !/^(human|person)(\b|$)/.test(species)) {
+    return `Species-age lock: exactly ${age} as a ${portraitSafeText(species, 48)}. Use its anatomy and lifespan, not human age stages. At zero show its newborn or newly created form. Never replace its species with human anatomy.`;
+  }
   if (age === 0) {
     return 'AGE 0 NEWBORN LOCK: render an unmistakable newborn infant under one month old with newborn head-to-body proportions, a very small body, soft round newborn features, sparse fine baby hair, and age-appropriate swaddling or infant clothing. The newborn cannot sit, stand, pose like an older child, wear makeup or jewelry, have an adult hairstyle, or look like a toddler, child, teen, adult, or elderly person.';
   }
@@ -1382,7 +1386,7 @@ function portraitAgeAppearanceDirective(subject) {
 }
 
 function portraitVisualFacts(subject) {
-  const visualIdentity = portraitSafeText(subject.visualIdentity, 120);
+  const visualIdentity = portraitSafeText(subject.visualIdentity, 180);
   const appearanceDescription = portraitSafeText(subject.appearanceDescription, 120);
   return [
     `exact chronological age: ${subject.age} years old (${subject.lifeStage})`,
@@ -1403,7 +1407,7 @@ function portraitVisualFacts(subject) {
 function portraitGenerationPrompt(subject) {
   const facts = portraitVisualFacts(subject);
   const styleDirection = subject.style === 'stylized'
-    ? 'Create one polished semi-realistic digital life-simulator portrait for AgeUp. It must look softly illustrated rather than photographed: use believable anatomy and proportions, gently simplified skin and hair textures, clean digital rendering, soft natural light, and subtle expressive warmth. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot, caricature, or an imitation of a named game or character.'
+    ? 'Create one polished semi-realistic digital life-simulator portrait for AgeUp. It must look softly illustrated rather than photographed: use believable anatomy and proportions, gently simplified skin and hair textures, clean digital rendering, soft natural light, and subtle expressive warmth. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot or caricature. Preserve the named character\'s recognizable design and species.'
     : 'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.';
   const prompt = [
     portraitAgeAppearanceDirective(subject),
@@ -1424,7 +1428,7 @@ function portraitEditPrompt(subject, requestedChange) {
   const change = portraitSafeText(requestedChange, 320);
   if (!change) throw new Error('Describe the appearance change to make.');
   const styleDirection = subject.style === 'stylized'
-    ? 'Keep the exact polished semi-realistic digital life-simulator portrait style. It must remain softly illustrated rather than photographed, with believable anatomy, gently simplified skin and hair textures, clean digital rendering, soft natural light, and subtle expressive warmth. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot, caricature, or an imitation of a named game or character.'
+    ? 'Keep the exact polished semi-realistic digital life-simulator portrait style. It must remain softly illustrated rather than photographed, with believable anatomy, gently simplified skin and hair textures, clean digital rendering, soft natural light, and subtle expressive warmth. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot or caricature. Preserve the named character\'s recognizable design and species.'
     : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
   return [
     portraitAgeAppearanceDirective(subject),

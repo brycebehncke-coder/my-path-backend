@@ -501,7 +501,7 @@ test('portrait generation prompts stay within the Cloudflare 2048-character cont
   assert.match(prompt, /exact chronological age: 29 years old/i);
   assert.match(prompt, /authoritative individual identity:/i);
   assert.match(prompt, /binding biological family inheritance:/i);
-  assert.match(prompt, /unmistakably young adult/i);
+  assert.match(prompt, /species-age lock/i);
   assert.match(prompt, /real animals keep normal breed anatomy/i);
   assert.match(prompt, /no words, labels, logos/i);
 });
@@ -589,7 +589,8 @@ test('portrait style is explicit and changes the generation contract', () => {
   assert.match(portraitGenerationPrompt(stylized), /semi-realistic digital life-simulator portrait/i);
   assert.match(portraitGenerationPrompt(stylized), /softly illustrated rather than photographed/i);
   assert.match(portraitGenerationPrompt(stylized), /never make it ultra-photorealistic, camera-like/i);
-  assert.match(portraitGenerationPrompt(stylized), /imitation of a named game or character/i);
+  assert.match(portraitGenerationPrompt(stylized), /preserve the named character's recognizable design and species/i);
+  assert.doesNotMatch(portraitGenerationPrompt(stylized), /imitation of a named game or character/i);
   assert.doesNotMatch(portraitGenerationPrompt(stylized), /highly realistic lifelike portrait/i);
   assert.match(portraitEditPrompt(stylized, 'add a hat'), /keep the exact polished semi-realistic digital life-simulator portrait style/i);
 });
@@ -612,6 +613,23 @@ test('portrait prompts preserve the exact character and biological family identi
   assert.match(prompt, /biological family inheritance: Nigerian family/i);
   assert.match(prompt, /occupation: student/i);
   assert.match(prompt, /never change the stated complexion, ancestry/i);
+});
+
+test('fictional portraits preserve distinct species and do not use human aging for nonhumans', () => {
+  for (const [name, species, visual] of [
+    ['Shrek', 'ogre', 'Green skin, round tubular ears, broad nose, brown vest.'],
+    ['Donkey', 'donkey', 'Gray fur, long ears and an equine muzzle.'],
+    ['Dobby', 'house-elf', 'Large green eyes and large batlike ears.'],
+    ['R2-D2', 'astromech droid', 'White cylindrical body, blue-and-silver domed head.'],
+  ]) {
+    const subject = normalizePortraitSubject({profile_id: name.replace(/[^a-z0-9]/gi, '-'), name, species, age: 100, visual_identity: visual});
+    const prompt = portraitGenerationPrompt(subject);
+    assert.match(prompt, /species-age lock/i);
+    assert.ok(prompt.includes(name));
+    assert.ok(prompt.includes(species));
+    assert.ok(prompt.includes(visual));
+    assert.doesNotMatch(prompt, /show natural older-adult features/i);
+  }
 });
 
 test('portrait subjects preserve unusual custom-life species without accepting prompt-sized fields', () => {
