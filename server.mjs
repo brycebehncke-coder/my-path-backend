@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v12-deduplicated-deadline';
+const backendRevision = 'generated-character-portraits-v13-scene-snapshots';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1342,6 +1342,7 @@ function normalizePortraitSubject(body) {
     visualIdentity: portraitSafeText(body.visual_identity, 360),
     familyIdentity: portraitSafeText(body.family_identity, 360),
     occupation: portraitSafeText(body.occupation, 140),
+    sceneDescription: portraitSafeText(body.scene_description, 350),
     style: portraitSafeText(body.style, 20).toLowerCase() === 'stylized'
       ? 'stylized'
       : 'realistic',
@@ -1408,22 +1409,28 @@ function portraitGenerationPrompt(subject) {
   const facts = portraitVisualFacts(subject);
   const styleDirection = subject.style === 'stylized'
     ? 'Create one polished semi-realistic digital life-simulator portrait, softly illustrated rather than photographed, with gently simplified textures and natural lighting. Preserve the named character\'s recognizable design and species; do not reinterpret it as a human.'
-    : 'Create one highly realistic lifelike portrait with natural textures and lighting, preserving the named character\'s recognizable design, proportions and species. A fictional creature remains that creature, not a human actor.';
-  const prompt = [
+    : 'Create one highly realistic lifelike portrait with natural textures and lighting. Preserve the named character\'s recognizable design and species, not a human actor.';
+  const directions = [
     portraitAgeAppearanceDirective(subject),
+    subject.role === 'player'
+      ? `Snapshot at ${portraitSafeText(subject.location, 100)}, ${portraitSafeText(subject.era, 40)}. Environment, clothing and expression match: ${portraitSafeText(subject.sceneDescription, 180) || 'the stated location and role'}. No graphic injuries or studio background.`
+      : 'Show one centered forward-facing subject with a quiet neutral background.',
     /^(human|person)$/.test(subject.species.toLowerCase())
-      ? 'The exact chronological age is the highest-priority visual fact and overrides conflicting appearance details.'
-      : 'Preserve species and identity; interpret chronological age using that species, never a human age stage for a nonhuman.',
-    `Binding subject facts: ${facts}. These facts must visibly control the result; never change the stated complexion, ancestry, hair, eyes, gender, age, or species.`,
-    'Portray only the exact named subject. Never substitute or add a parent, caretaker, relative, spouse, coworker, or other person.',
+      ? 'Exact age is the highest-priority visual fact.'
+      : 'Use species-appropriate aging.',
+    'Never change the stated complexion, ancestry, hair, eyes, gender, age or species.',
+    'Never substitute or add a parent, caretaker, relative or other subject.',
     styleDirection,
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
-    'Respect the exact species or breed and keep its anatomy coherent. Real animals keep normal breed anatomy and posture; quadrupeds stay quadrupedal. Never humanize an animal unless explicitly requested.',
-    'Use a normal, relaxed, slightly happy expression and healthy rested appearance when consistent with the character.',
-    'Preserve this identity across ages. Relatives visibly share inherited traits. Never change ancestry or complexion without an explicit life fact.',
-    'Show exactly one centered, forward-facing subject in head-and-upper-body framing against a quiet neutral background. Respect culture, clothing, era, and coherent anatomy.',
+    'Respect exact species or breed. Real animals keep normal breed anatomy and posture. Never humanize an animal unless explicitly requested.',
+    subject.role === 'player'
+      ? 'Use an expression consistent with the situation; a battlefield is not a cheerful studio pose.'
+      : 'Use a normal, relaxed, slightly happy expression and healthy rested appearance when consistent with the character.',
+    'Keep one identifiable main subject in head-and-upper-body framing.',
   ].join(' ');
-  return portraitSafeText(prompt, portraitGenerationPromptMaximumLength);
+  // Bound data rather than chopping off essential rendering directions mid-sentence.
+  const factsBudget = Math.max(0, portraitGenerationPromptMaximumLength - directions.length - 24);
+  return `${directions} Binding subject facts: ${portraitSafeText(facts, factsBudget)}`;
 }
 
 function portraitEditPrompt(subject, requestedChange) {
@@ -1441,10 +1448,14 @@ function portraitEditPrompt(subject, requestedChange) {
     subject.visualIdentity && `Preserve this character identity: ${portraitSafeText(subject.visualIdentity, 180)}.`,
     subject.familyIdentity && `Preserve these inherited family traits: ${portraitSafeText(subject.familyIdentity, 180)}.`,
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
-    'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
+    subject.role === 'player'
+      ? `Preserve identity and anatomy. Update background, clothing, lighting and expression to the current location ${portraitSafeText(subject.location, 120)}, ${portraitSafeText(subject.era, 60)}. Current scene: ${portraitSafeText(subject.sceneDescription, 240)}. No graphic injuries; keep the main character clearly visible.`
+      : 'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
     styleDirection,
-    'Keep a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when the subject anatomy allows it, and a healthy rested appearance. Do not make the subject sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless the requested change explicitly requires it.',
+    subject.role === 'player'
+      ? 'Use an expression appropriate to the scene; never force a smile during danger or distress.'
+      : 'Use a normal, relaxed, slightly happy expression and healthy rested appearance. Do not make the subject sad, exhausted, distressed unless requested.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].filter(Boolean).join(' ');
 }

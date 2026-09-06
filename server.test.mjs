@@ -564,6 +564,17 @@ test('portrait prompts request normal slightly happy and rested expressions', ()
   assert.match(editedPrompt, /do not make the subject sad, exhausted, distressed/i);
 });
 
+test('player portraits show the current scene instead of a studio background', () => {
+  const subject = normalizePortraitSubject({ profile_id: 'dday-soldier', role: 'player',
+    name: 'James Miller', age: 21, species: 'human', location: 'Omaha Beach, Normandy, France',
+    era: 'June 1944', scene_description: 'An American infantryman lands under fire, wearing his helmet and field uniform.' });
+  const prompt = portraitGenerationPrompt(subject);
+  assert.match(prompt, /Omaha Beach/);
+  assert.match(prompt, /infantryman lands under fire/);
+  assert.doesNotMatch(prompt, /against a quiet neutral background/);
+  assert.match(portraitEditPrompt(subject, 'update age'), /Update background/);
+});
+
 test('portrait style is explicit and changes the generation contract', () => {
   const realistic = normalizePortraitSubject({
     profile_id: 'realistic-style-profile',
@@ -646,7 +657,7 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.equal(subject.revision, 2);
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
-  assert.match(prompt, /exactly one centered, forward-facing subject/i);
+  assert.match(prompt, /one identifiable main subject in head-and-upper-body framing/i);
   assert.match(prompt, /highly realistic lifelike portrait/i);
   assert.match(prompt, /exact chronological age: 9 years old/i);
   assert.match(prompt, /natural textures and lighting/i);
