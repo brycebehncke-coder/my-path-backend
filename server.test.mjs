@@ -81,6 +81,46 @@ function portraitProviderResponse(status = 200, message = '') {
 
 const flushPortraitPromises = () => new Promise((resolve) => setImmediate(resolve));
 
+test('custom life schema settles identity and cast before writing the story without changing its fields', () => {
+  const field = { type: 'string' };
+  const shape = (properties) => ({ type: 'object', properties, required: Object.keys(properties), additionalProperties: false });
+  const schema = shape({ s: field, people: { type: 'array', items: shape({ visual: field, n: field, r: field }) },
+    place: shape({ c: field }), cast: { type: 'array', items: field }, p: shape({ visual: field, a: field, n: field }) });
+  const request = { model: 'gpt-5-mini', messages: [{ role: 'user', content: 'Custom life' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'gpt5_open_custom_takeover_launch_v5', strict: true, schema } } };
+  const before = JSON.stringify(request);
+  const result = forwardedChatBody(request, routeForModel('gpt-5-mini')).response_format.json_schema.schema;
+  assert.deepEqual(Object.keys(result.properties), ['p', 'place', 'cast', 'people', 's']);
+  assert.equal(Object.keys(result.properties.p.properties)[0], 'n');
+  assert.equal(Object.keys(result.properties.people.items.properties)[0], 'n');
+  assert.deepEqual(result.properties.s, schema.properties.s);
+  assert.deepEqual(new Set(result.required), new Set(schema.required));
+  assert.equal(JSON.stringify(request), before);
+});
+
+test('time jump schema resolves the whole interval before generating its new scene', () => {
+  const properties = { new_instance: { type: 'string' }, scene_memory: { type: 'string' },
+    elapsed_seconds: { type: 'integer', const: 604800 }, resolution: { type: 'string' },
+    health_delta: { type: 'integer', minimum: -100 }, custom_extra: { type: 'boolean' } };
+  const request = { model: 'gpt-5-mini', messages: [{ role: 'user', content: 'Age one week' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'novel_battlefield_campaign_age_v3', strict: true,
+      schema: { type: 'object', properties, required: Object.keys(properties), additionalProperties: false } } } };
+  const result = forwardedChatBody(request, routeForModel('gpt-5-mini')).response_format.json_schema.schema;
+  assert.deepEqual(Object.keys(result.properties), ['elapsed_seconds', 'resolution', 'new_instance', 'health_delta', 'scene_memory', 'custom_extra']);
+  assert.deepEqual(result.properties, properties);
+  assert.deepEqual(new Set(result.required), new Set(Object.keys(properties)));
+});
+
+test('action story is written before extracting injury evidence and effects', () => {
+  const properties = { effects: { type: 'object' }, hiddenFacts: { type: 'array' }, answer: { type: 'string' } };
+  const request = { model: 'gpt-5-mini', messages: [{ role: 'user', content: 'I sprain my ankle' }],
+    response_format: { type: 'json_schema', json_schema: { name: 'novel_action', strict: true,
+      schema: { type: 'object', properties, required: Object.keys(properties), additionalProperties: false } } } };
+  const result = forwardedChatBody(request, routeForModel('gpt-5-mini')).response_format.json_schema.schema;
+  assert.deepEqual(Object.keys(result.properties), ['answer', 'effects', 'hiddenFacts']);
+  assert.deepEqual(result.properties, properties);
+});
+
 test('portrait generation preserves identity and never rewrites a rejected request', async (t) => {
   const subject = normalizePortraitSubject({ profile_id: 'fallback', age: 5, species: 'elf' });
   for (const [status, message] of [

@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'generated-character-portraits-v13-scene-snapshots';
+const backendRevision = 'custom-life-v14-ordered-state-and-scene-snapshots';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1837,12 +1837,50 @@ function openAICreditFallbackBody(body, fallbackRoute) {
   return fallbackBody;
 }
 
+function orderedGameplayResponseFormat(format) {
+  const schema = format?.json_schema?.schema;
+  const properties = schema?.properties;
+  if (format?.type !== 'json_schema' || !properties) return format;
+  const customLife = properties.p && properties.place && properties.people && properties.s;
+  const timeJump = properties.resolution && properties.new_instance;
+  const action = properties.answer && properties.effects;
+  if (!customLife && !timeJump && !action) return format;
+  function orderedObject(value, priority) {
+    const keys = [...priority.filter((key) => Object.hasOwn(value.properties, key)),
+      ...Object.keys(value.properties).filter((key) => !priority.includes(key))];
+    return { ...value, properties: Object.fromEntries(keys.map((key) => [key, value.properties[key]])),
+      ...(Array.isArray(value.required) ? { required: keys.filter((key) => value.required.includes(key)) } : {}) };
+  }
+  // Swift dictionaries arrive in varying order. Structured output follows schema
+  // order, so settle the cast before prose and resolve time before the next scene.
+  const ordered = orderedObject(schema, customLife
+    ? ['p', 'place', 'life', 'world', 'war', 'cast', 'people', 'assets', 'expenses', 'next', 's']
+    : action ? ['answer', 'elapsed_seconds', 'elapsed_minutes', 'effects', 'player_died', 'death_cause',
+      'war_ended', 'combat_kills', 'trauma_severity', 'trauma_detail', 'ptsd_triggered', 'hiddenFacts']
+    : ['elapsed_seconds', 'resolution', 'ending_city', 'ending_country', 'ending_country_iso2',
+      'player_died', 'death_cause', 'new_instance', 'health_delta', 'injury_detail', 'injury_severity',
+      'war_ended', 'combat_kills', 'trauma_severity', 'trauma_detail', 'ptsd_triggered', 'scene_memory', 'next_beats']);
+  if (customLife && ordered.properties.p.properties) {
+    ordered.properties.p = orderedObject(ordered.properties.p,
+      ['n', 'species', 'g', 'y', 'sm', 'sd', 'a', 'h', 'by', 'dy', 'visual']);
+  }
+  if (customLife && ordered.properties.people.items?.properties) {
+    ordered.properties.people = { ...ordered.properties.people,
+      items: orderedObject(ordered.properties.people.items,
+        ['n', 'r', 't', 'g', 'a', 'k', 'i', 'c', 'j', 'l', 'd', 'sp', 'm', 'w', 'species', 'visual']) };
+  }
+  return { ...format, json_schema: { ...format.json_schema, schema: ordered } };
+}
+
 function forwardedChatBody(body, route) {
   const forwarded = {
     ...body,
     model: route.upstreamModel,
   };
   delete forwarded.provider;
+  if (forwarded.response_format) {
+    forwarded.response_format = orderedGameplayResponseFormat(forwarded.response_format);
+  }
 
   if (isOpenAIReasoningRoute(route)) {
     if (forwarded.max_completion_tokens == null && forwarded.max_tokens != null) {
@@ -1878,7 +1916,7 @@ function forwardedChatBody(body, route) {
     // Serializing the same large schema into the prompt a second time made the
     // emergency DeepSeek fallback hit its output limit and start another full
     // generation after the app's loading deadline.
-    const jsonInstruction = deepSeekJSONInstructionForBody(body);
+    const jsonInstruction = deepSeekJSONInstructionForBody(forwarded);
     if (jsonInstruction) {
       forwarded.messages = appendSystemInstruction(body.messages, jsonInstruction);
       forwarded.response_format = { type: 'json_object' };
