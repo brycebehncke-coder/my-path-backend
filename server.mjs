@@ -1389,7 +1389,7 @@ function portraitVisualFacts(subject) {
   const visualIdentity = portraitSafeText(subject.visualIdentity, 180);
   const appearanceDescription = portraitSafeText(subject.appearanceDescription, 120);
   return [
-    `exact chronological age: ${subject.age} years old (${subject.lifeStage})`,
+    `exact chronological age: ${subject.age} years old${/^(human|person)$/.test(subject.species.toLowerCase()) ? ` (${subject.lifeStage})` : ', interpreted using this species lifespan'}`,
     `exact species or breed: ${portraitSafeText(subject.species, 48)}`,
     subject.gender && `gender: ${portraitSafeText(subject.gender, 20)}`,
     visualIdentity && `authoritative individual identity: ${visualIdentity}`,
@@ -1407,17 +1407,19 @@ function portraitVisualFacts(subject) {
 function portraitGenerationPrompt(subject) {
   const facts = portraitVisualFacts(subject);
   const styleDirection = subject.style === 'stylized'
-    ? 'Create one polished semi-realistic digital life-simulator portrait for AgeUp. It must look softly illustrated rather than photographed: use believable anatomy and proportions, gently simplified skin and hair textures, clean digital rendering, soft natural light, and subtle expressive warmth. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot or caricature. Preserve the named character\'s recognizable design and species.'
-    : 'Create one highly realistic lifelike portrait for AgeUp with photographic anatomy, believable proportions, natural skin or fur texture, lighting, and color. Never use cartoon, flat or simple illustration, anime, chibi, mascot, vector, clay, toy, emoji, or caricature.';
+    ? 'Create one polished semi-realistic digital life-simulator portrait, softly illustrated rather than photographed, with gently simplified textures and natural lighting. Preserve the named character\'s recognizable design and species; do not reinterpret it as a human.'
+    : 'Create one highly realistic lifelike portrait with natural textures and lighting, preserving the named character\'s recognizable design, proportions and species. A fictional creature remains that creature, not a human actor.';
   const prompt = [
     portraitAgeAppearanceDirective(subject),
-    'The exact chronological age is the highest-priority visual fact and overrides every conflicting detail.',
+    /^(human|person)$/.test(subject.species.toLowerCase())
+      ? 'The exact chronological age is the highest-priority visual fact and overrides conflicting appearance details.'
+      : 'Preserve species and identity; interpret chronological age using that species, never a human age stage for a nonhuman.',
     `Binding subject facts: ${facts}. These facts must visibly control the result; never change the stated complexion, ancestry, hair, eyes, gender, age, or species.`,
     'Portray only the exact named subject. Never substitute or add a parent, caretaker, relative, spouse, coworker, or other person.',
     styleDirection,
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
     'Respect the exact species or breed and keep its anatomy coherent. Real animals keep normal breed anatomy and posture; quadrupeds stay quadrupedal. Never humanize an animal unless explicitly requested.',
-    'Give the subject a normal, relaxed, slightly happy expression, bright alert eyes, a gentle natural closed-mouth smile when anatomy allows it, and a healthy rested appearance. Never make them look sad, exhausted, distressed, gaunt, sickly, or worn out unless an explicit immutable fact requires it.',
+    'Use a normal, relaxed, slightly happy expression and healthy rested appearance when consistent with the character.',
     'Preserve this identity across ages. Relatives visibly share inherited traits. Never change ancestry or complexion without an explicit life fact.',
     'Show exactly one centered, forward-facing subject in head-and-upper-body framing against a quiet neutral background. Respect culture, clothing, era, and coherent anatomy.',
   ].join(' ');
@@ -1432,7 +1434,7 @@ function portraitEditPrompt(subject, requestedChange) {
     : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
   return [
     portraitAgeAppearanceDirective(subject),
-    `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${subject.lifeStage} ${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
+    `The subject must end at the exact chronological age of ${subject.age} years old and remains a ${/^(human|person)$/.test(subject.species.toLowerCase()) ? subject.lifeStage + ' ' : ''}${subject.species}${subject.gender ? `, gender ${subject.gender}` : ''}.`,
     'The exact chronological age is the highest-priority visual fact. If image 0 looks older or younger, correct it completely rather than preserving that incorrect apparent age.',
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
@@ -1445,27 +1447,6 @@ function portraitEditPrompt(subject, requestedChange) {
     'Keep a normal, relaxed, slightly happy expression with bright alert eyes, a gentle natural closed-mouth smile when the subject anatomy allows it, and a healthy rested appearance. Do not make the subject sad, exhausted, distressed, defeated, gaunt, sickly, weather-beaten, or worn out unless the requested change explicitly requires it.',
     'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
   ].filter(Boolean).join(' ');
-}
-
-function portraitGenerationFantasySafetyPrompt(subject) {
-  return portraitSafeText([
-    `Create a wholesome, family-friendly, fully clothed portrait of one fictional fantasy child who is exactly ${subject.age} years old.`,
-    subject.gender && `Gender: ${portraitSafeText(subject.gender, 20)}.`,
-    subject.visualIdentity && `Binding visual traits: ${portraitSafeText(subject.visualIdentity, 160)}.`,
-    subject.familyIdentity && `Binding inherited traits: ${portraitSafeText(subject.familyIdentity, 140)}.`,
-    subject.style === 'stylized'
-      ? 'Use a polished semi-realistic digital life-simulator style that is softly illustrated rather than photographed.'
-      : 'Use a lifelike realistic portrait style with natural lighting.',
-    'Use coherent age-appropriate fantasy anatomy, a cheerful relaxed expression, and a plain background.',
-    'No weapons, violence, injury, fear, distress, text, extra characters, or exposed body.',
-  ].filter(Boolean).join(' '), portraitGenerationPromptMaximumLength);
-}
-
-function portraitNeedsFantasySafetyFallback(subject) {
-  const species = portraitSafeText(subject.species, 100).toLowerCase();
-  const isHuman = species === 'human' || species === 'person';
-  const isPet = portraitSafeText(subject.role, 40).toLowerCase() === 'pet';
-  return subject.age < 18 && !isHuman && !isPet;
 }
 
 function decodedPortraitReferenceImage(rawValue) {
@@ -1503,10 +1484,12 @@ function portraitRequestIsAllowed(playerHash, at = new Date()) {
 }
 
 class PortraitRequestError extends Error {
-  constructor(code, message, statusCode) {
+  constructor(code, message, statusCode, retryable = true, retryAfterSeconds = 20) {
     super(message);
     this.code = code;
     this.statusCode = statusCode;
+    this.retryable = retryable;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -1601,8 +1584,8 @@ function cloudflarePortraitPromptWasRejected(status, payload) {
   if (/auth|forbidden|permission|rate\s*limit|too many requests|quota|credit|billing|api key|access token|time[ -]?out|timed out|deadline|unavailable|overload/i.test(detail)) {
     return false;
   }
-  return /\b(prompt|content|safety|nsfw|moderation)\b/i.test(detail)
-    && /\b(reject(?:ed|ion)?|block(?:ed)?|filter(?:ed)?|unsafe|disallow(?:ed)?|violat(?:es?|ed|ion)|inappropriate|not allowed|too long|invalid|exceed(?:s|ed)?)\b/i.test(detail);
+  return /\b(prompt|output|content|safety|nsfw|moderation)\b/i.test(detail)
+    && /\b(reject(?:ed|ion)?|block(?:ed)?|filter(?:ed)?|flagged|unsafe|disallow(?:ed)?|violat(?:es?|ed|ion)|inappropriate|not allowed|too long|invalid|exceed(?:s|ed)?)\b/i.test(detail);
 }
 
 function cloudflarePortraitURL(model) {
@@ -1633,9 +1616,19 @@ async function cloudflarePortraitImage(response) {
       || payload?.error?.message
       || payload?.raw
       || `Cloudflare returned HTTP ${response.status}.`;
-    const error = new Error(`Portrait generation failed: ${portraitSafeText(detail, 300)}`);
-    error.portraitPromptRejected = cloudflarePortraitPromptWasRejected(response.status, payload);
-    throw error;
+    if (/daily free allocation|quota|insufficient.*(?:credit|balance)|billing|neurons.*(?:exceeded|limit)/i.test(detail)) {
+      throw new PortraitRequestError('portrait_provider_quota_exhausted',
+        'The image service has reached its allowance. Your life is ready, but new portraits are unavailable until the service allowance is restored.', 503, false, 300);
+    }
+    if (cloudflarePortraitPromptWasRejected(response.status, payload)) {
+      throw new PortraitRequestError('portrait_content_rejected',
+        'The image service declined this portrait. Your character details have not been changed.', 422, false, 300);
+    }
+    if ([401, 403].includes(response.status)) {
+      throw new PortraitRequestError('portrait_provider_authorization_failed',
+        'The image service needs an account update before portraits can generate.', 503, false, 300);
+    }
+    throw new Error(`Portrait generation failed: ${portraitSafeText(detail, 300)}`);
   }
   const encoded = payload?.result?.image || payload?.image;
   if (typeof encoded !== 'string' || !encoded.trim()) {
@@ -1673,54 +1666,15 @@ function portraitGenerationFormData(body) {
 }
 
 async function generateCloudflarePortrait(subject) {
-  let lastError;
-  const requestBodies = [
-    portraitGenerationRequestBody(subject),
-    portraitGenerationRequestBody(
-      subject,
-      portraitSafeText([
-        portraitAgeAppearanceDirective(subject),
-        'The exact chronological age is the highest-priority visual fact and overrides every conflicting detail.',
-        subject.style === 'stylized'
-          ? 'Softly realistic mobile life-sim portrait with believable anatomy, natural lighting, smooth clean detail, and a friendly expression; realistic but not ultra-photographic.'
-          : 'Lifelike realistic mobile life-sim portrait with natural anatomy and a friendly expression.',
-        `Exactly one ${subject.age}-year-old ${subject.species}.`,
-        subject.gender && `Gender: ${subject.gender}.`,
-        subject.visualIdentity && `Identity: ${subject.visualIdentity}.`,
-        subject.familyIdentity && `Inherited traits: ${subject.familyIdentity}.`,
-        'Centered, forward-facing, quiet background, no text, no extra subjects, no hybrid anatomy.',
-      ].filter(Boolean).join(' '), portraitGenerationPromptMaximumLength),
-      'generation-fallback',
-    ),
-  ];
-  if (portraitNeedsFantasySafetyFallback(subject)) {
-    requestBodies.push(portraitGenerationRequestBody(
-      subject,
-      portraitGenerationFantasySafetyPrompt(subject),
-      'generation-fantasy-safety-fallback',
-    ));
-  }
   return withPortraitProviderDeadline(async (signal) => {
-    for (const body of requestBodies) {
-      signal.throwIfAborted();
-      try {
-        const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${cloudflareApiToken}`,
-            Accept: 'application/json',
-          },
-          body: portraitGenerationFormData(body),
-          signal,
-        });
-        return await cloudflarePortraitImage(response);
-      } catch (error) {
-        signal.throwIfAborted();
-        if (!error?.portraitPromptRejected) throw error;
-        lastError = error;
-      }
-    }
-    throw lastError || new Error('Portrait generation failed.');
+    signal.throwIfAborted();
+    const response = await fetch(cloudflarePortraitURL(portraitGenerationModel), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cloudflareApiToken}`, Accept: 'application/json' },
+      body: portraitGenerationFormData(portraitGenerationRequestBody(subject)),
+      signal,
+    });
+    return await cloudflarePortraitImage(response);
   });
 }
 
@@ -2497,7 +2451,7 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         if (error instanceof PortraitRequestError) {
           return sendJson(res, error.statusCode, {
-            error: { code: error.code, message: error.message },
+            error: { code: error.code, message: error.message, retryable: error.retryable, retry_after_seconds: error.retryAfterSeconds },
           }, { 'Cache-Control': 'no-store' });
         }
         console.error('Portrait provider request failed:', error instanceof Error ? error.message : error);
@@ -2987,7 +2941,6 @@ export {
   normalizeModelName,
   parseCreatorCodeCatalog,
   portraitEditPrompt,
-  portraitGenerationFantasySafetyPrompt,
   portraitGenerationPrompt,
   portraitGenerationRequestBody,
   portraitLifeStage,

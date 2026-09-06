@@ -45,7 +45,6 @@ import {
   playerQuotaReceipt,
   playIntegrityRequestHash,
   portraitEditPrompt,
-  portraitGenerationFantasySafetyPrompt,
   portraitGenerationPrompt,
   portraitGenerationRequestBody,
   portraitLifeStage,
@@ -82,7 +81,7 @@ function portraitProviderResponse(status = 200, message = '') {
 
 const flushPortraitPromises = () => new Promise((resolve) => setImmediate(resolve));
 
-test('portrait generation only falls back for explicit prompt or content rejections', async (t) => {
+test('portrait generation preserves identity and never rewrites a rejected request', async (t) => {
   const subject = normalizePortraitSubject({ profile_id: 'fallback', age: 5, species: 'elf' });
   for (const [status, message] of [
     [401, 'Authentication failed: content rejected'],
@@ -108,18 +107,17 @@ test('portrait generation only falls back for explicit prompt or content rejecti
     await assert.rejects(generateCloudflarePortrait(subject), /fetch failed/);
     assert.equal(provider.mock.callCount(), 1);
   });
-  await t.test('all fallback attempts share their signal and keep distinct seeds', async (t) => {
-    const provider = t.mock.method(globalThis, 'fetch', async () => (
-      provider.mock.callCount() < 2
-        ? portraitProviderResponse(400, 'The prompt was rejected by the content safety filter.')
-        : portraitProviderResponse()
-    ));
-    const result = await generateCloudflarePortrait(subject);
-    assert.equal(result.image.length, 120);
-    assert.equal(provider.mock.callCount(), 3);
-    const calls = provider.mock.calls.map((call) => call.arguments[1]);
-    assert.equal(new Set(calls.map((call) => call.signal)).size, 1);
-    assert.equal(new Set(calls.map((call) => call.body.get('seed'))).size, 3);
+  await t.test('moderation rejection is not retried with a different identity', async (t) => {
+    const provider = t.mock.method(globalThis, 'fetch', async () =>
+      portraitProviderResponse(400, 'The prompt was rejected by the content safety filter.'));
+    await assert.rejects(generateCloudflarePortrait(subject), { code: 'portrait_content_rejected', retryable: false });
+    assert.equal(provider.mock.callCount(), 1);
+  });
+  await t.test('Cloudflare output-flagged responses also stop immediately', async (t) => {
+    const provider = t.mock.method(globalThis, 'fetch', async () =>
+      portraitProviderResponse(400, 'AiError: Your output has been flagged. Please choose another prompt / input image combination.'));
+    await assert.rejects(generateCloudflarePortrait(subject), { code: 'portrait_content_rejected', retryable: false });
+    assert.equal(provider.mock.callCount(), 1);
   });
   await t.test('a successful response without an image is not retried', async (t) => {
     const provider = t.mock.method(globalThis, 'fetch', async () => new Response('{}'));
@@ -176,29 +174,21 @@ test('portrait generation and editing bound fetch and response reading even when
   }
 });
 
-test('portrait fallbacks use only the remaining shared 45-second deadline', async (t) => {
+test('a delayed provider quota failure stays nonretryable and is not masked as a timeout', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const first = deferredPortraitProvider();
-  const second = deferredPortraitProvider();
-  const provider = t.mock.method(globalThis, 'fetch', () => (
-    provider.mock.callCount() === 0 ? first.promise : second.promise
-  ));
+  const provider = t.mock.method(globalThis, 'fetch', () => first.promise);
   const subject = normalizePortraitSubject({ profile_id: 'shared-deadline', age: 5, species: 'elf' });
-  const outcome = assert.rejects(generateCloudflarePortrait(subject), { name: 'TimeoutError' });
+  const outcome = assert.rejects(generateCloudflarePortrait(subject), {
+    code: 'portrait_provider_quota_exhausted', retryable: false, statusCode: 503,
+  });
   t.mock.timers.tick(30_000);
-  first.resolve(portraitProviderResponse(422, 'Content rejected by safety filter'));
+  first.resolve(portraitProviderResponse(429, 'you have used up your daily free allocation of 10,000 neurons'));
   await flushPortraitPromises();
-  assert.equal(provider.mock.callCount(), 2);
-  const signals = provider.mock.calls.map((call) => call.arguments[1].signal);
-  assert.equal(signals[0], signals[1]);
-  t.mock.timers.tick(14_999);
-  assert.equal(signals[1].aborted, false);
-  t.mock.timers.tick(1);
   await outcome;
-  assert.equal(signals[1].aborted, true);
-  second.resolve(portraitProviderResponse(400, 'Prompt rejected'));
+  t.mock.timers.tick(60_000);
   await flushPortraitPromises();
-  assert.equal(provider.mock.callCount(), 2);
+  assert.equal(provider.mock.callCount(), 1);
 });
 
 test('portrait keys include every normalized subject field, operation, change, player, and reference bytes', () => {
@@ -442,8 +432,13 @@ test('portrait routes authenticate, normalize, deduplicate, and charge quota onl
         assert.equal(provider.mock.callCount(), callsBefore + 1);
         if (timeout) t.mock.timers.tick(45_000);
         else pending.resolve(portraitProviderResponse(401, 'Unauthorized'));
-        assert.equal((await owner).status, 502);
-        assert.equal((await waiter).status, 502);
+        const failedOwner = await owner;
+        assert.equal(failedOwner.status, timeout ? 502 : 503);
+        assert.equal((await waiter).status, timeout ? 502 : 503);
+        if (!timeout) {
+          assert.equal(failedOwner.body.error.retryable, false);
+          assert.equal(failedOwner.body.error.code, 'portrait_provider_authorization_failed');
+        }
         pending.resolve(portraitProviderResponse());
         await flushPortraitPromises();
         nextProvider = () => portraitProviderResponse();
@@ -560,9 +555,8 @@ test('portrait prompts request normal slightly happy and rested expressions', ()
   });
   const generatedPrompt = portraitGenerationPrompt(subject);
   assert.match(generatedPrompt, /normal, relaxed, slightly happy expression/i);
-  assert.match(generatedPrompt, /gentle natural closed-mouth smile/i);
   assert.match(generatedPrompt, /healthy rested appearance/i);
-  assert.match(generatedPrompt, /never make them look sad, exhausted, distressed/i);
+  assert.match(generatedPrompt, /when consistent with the character/i);
 
   const editedPrompt = portraitEditPrompt(subject, 'make their hair shorter');
   assert.match(editedPrompt, /normal, relaxed, slightly happy expression/i);
@@ -588,7 +582,7 @@ test('portrait style is explicit and changes the generation contract', () => {
   assert.match(portraitGenerationPrompt(realistic), /highly realistic lifelike portrait/i);
   assert.match(portraitGenerationPrompt(stylized), /semi-realistic digital life-simulator portrait/i);
   assert.match(portraitGenerationPrompt(stylized), /softly illustrated rather than photographed/i);
-  assert.match(portraitGenerationPrompt(stylized), /never make it ultra-photorealistic, camera-like/i);
+  assert.match(portraitGenerationPrompt(stylized), /gently simplified textures/i);
   assert.match(portraitGenerationPrompt(stylized), /preserve the named character's recognizable design and species/i);
   assert.doesNotMatch(portraitGenerationPrompt(stylized), /imitation of a named game or character/i);
   assert.doesNotMatch(portraitGenerationPrompt(stylized), /highly realistic lifelike portrait/i);
@@ -628,7 +622,7 @@ test('fictional portraits preserve distinct species and do not use human aging f
     assert.ok(prompt.includes(name));
     assert.ok(prompt.includes(species));
     assert.ok(prompt.includes(visual));
-    assert.doesNotMatch(prompt, /show natural older-adult features/i);
+    assert.doesNotMatch(prompt, /show natural older-adult features|years old \((child|adult|elderly)\)/i);
   }
 });
 
@@ -655,18 +649,18 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.match(prompt, /exactly one centered, forward-facing subject/i);
   assert.match(prompt, /highly realistic lifelike portrait/i);
   assert.match(prompt, /exact chronological age: 9 years old/i);
-  assert.match(prompt, /photographic anatomy/i);
+  assert.match(prompt, /natural textures and lighting/i);
   assert.match(prompt, /exact species or breed/i);
   assert.match(prompt, /real animals keep normal breed anatomy/i);
   assert.match(prompt, /never humanize an animal unless explicitly requested/i);
-  assert.match(prompt, /never use cartoon, flat or simple illustration/i);
+  assert.match(prompt, /not a human actor/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
   );
 });
 
-test('portrait fantasy safety fallback keeps age and visual identity without a filtered species label', () => {
+test('young nonhuman characters retain their species instead of becoming human children', () => {
   const subject = normalizePortraitSubject({
     profile_id: 'young-fantasy-profile',
     name: 'Gor Ashfang',
@@ -678,13 +672,13 @@ test('portrait fantasy safety fallback keeps age and visual identity without a f
     visual_identity: 'moss-green skin, amber eyes, and short black hair',
     family_identity: 'moss-green skin and amber eyes run in the Ashfang family',
   });
-  const prompt = portraitGenerationFantasySafetyPrompt(subject);
-  assert.match(prompt, /exactly 10 years old/i);
+  const prompt = portraitGenerationPrompt(subject);
+  assert.match(prompt, /exactly 10 as a orc/i);
   assert.match(prompt, /moss-green skin, amber eyes/i);
-  assert.match(prompt, /binding inherited traits/i);
+  assert.match(prompt, /binding biological family inheritance/i);
   assert.match(prompt, /softly illustrated rather than photographed/i);
-  assert.doesNotMatch(prompt, /orc/i);
-  assert.match(prompt, /no weapons, violence, injury/i);
+  assert.match(prompt, /orc/i);
+  assert.doesNotMatch(prompt, /10 years old \(child\)|fantasy child/i);
 });
 
 test('portrait list-price estimates distinguish generation from editing', () => {
