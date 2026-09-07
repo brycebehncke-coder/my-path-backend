@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'custom-life-v14-ordered-state-and-scene-snapshots';
+const backendRevision = 'portrait-v15-contextual-condition';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1343,6 +1343,7 @@ function normalizePortraitSubject(body) {
     familyIdentity: portraitSafeText(body.family_identity, 360),
     occupation: portraitSafeText(body.occupation, 140),
     sceneDescription: portraitSafeText(body.scene_description, 350),
+    conditionDescription: portraitSafeText(body.condition_description, 350),
     style: portraitSafeText(body.style, 20).toLowerCase() === 'stylized'
       ? 'stylized'
       : 'realistic',
@@ -1375,10 +1376,10 @@ function portraitAgeAppearanceDirective(subject) {
     return `Age appearance lock: render an unmistakable ${age}-year-old teenager, never an adult.`;
   }
   if (age <= 39) {
-    return `Age lock: exactly ${age}, an unmistakably young adult with smooth natural skin. No gray hair, deep wrinkles, age spots, sagging, jowls, or elderly features.`;
+    return `Age lock: exactly ${age}, an unmistakably young adult. No gray hair, deep wrinkles, age spots, sagging, jowls, or elderly features merely because of hardship; retain stated illness or deprivation.`;
   }
   if (age <= 54) {
-    return `Age appearance lock: for a person or humanoid exactly ${age}, render a healthy middle adult. Do not make them look elderly or add gray hair, deep wrinkles, age spots, sagging, or jowls unless an explicit appearance fact requires it.`;
+    return `Age appearance lock: exactly ${age}, a middle-aged adult. Do not make them look elderly; retain stated illness, exhaustion or deprivation without confusing these with old age.`;
   }
   if (age <= 64) {
     return `Age appearance lock: for a person or humanoid exactly ${age}, render a late-middle-aged adult, not an elderly person. Use only subtle, natural age cues and no exaggerated wrinkles, gray hair, sagging, or jowls unless an explicit appearance fact requires them.`;
@@ -1412,22 +1413,21 @@ function portraitGenerationPrompt(subject) {
     : 'Create one highly realistic lifelike portrait with natural textures and lighting. Preserve the named character\'s recognizable design and species, not a human actor.';
   const directions = [
     portraitAgeAppearanceDirective(subject),
+    `Current condition: ${portraitSafeText(subject.conditionDescription, 180) || 'use only the supplied life facts'}.`,
+    'Match expression and physical condition to this subject\'s circumstances. No automatic smile, cheerful pose, beautification or healthy/rested appearance. Show stated illness, deprivation, fear or grief respectfully, without graphic wounds. Do not transfer another person\'s condition onto this subject.',
     subject.role === 'player'
-      ? `Snapshot at ${portraitSafeText(subject.location, 100)}, ${portraitSafeText(subject.era, 40)}. Environment, clothing and expression match: ${portraitSafeText(subject.sceneDescription, 180) || 'the stated location and role'}. No graphic injuries or studio background.`
-      : 'Show one centered forward-facing subject with a quiet neutral background.',
+      ? `Snapshot at ${portraitSafeText(subject.location, 70)}, ${portraitSafeText(subject.era, 30)}. Scene: ${portraitSafeText(subject.sceneDescription, 160) || portraitSafeText(subject.subjectDescription, 160) || 'the stated location and role'}. No studio background.`
+      : `One centered subject. Own life context: ${subject.age > 0 ? (portraitSafeText(subject.subjectDescription, 160) || 'the stated role and location') : 'newborn'}.`,
     /^(human|person)$/.test(subject.species.toLowerCase())
       ? 'Exact age is the highest-priority visual fact.'
       : 'Use species-appropriate aging.',
-    'Never change the stated complexion, ancestry, hair, eyes, gender, age or species.',
+    'Never change the stated complexion, ancestry, hair, eyes, gender or species; temporary illness may affect appearance.',
     'Never substitute or add a parent, caretaker, relative or other subject.',
     styleDirection,
     'No words, labels, logos, borders, UI, extra subjects, or duplicate body parts.',
-    'Respect exact species or breed. Real animals keep normal breed anatomy and posture. Never humanize an animal unless explicitly requested.',
-    subject.role === 'player'
-      ? 'Use an expression consistent with the situation; a battlefield is not a cheerful studio pose.'
-      : 'Use a normal, relaxed, slightly happy expression and healthy rested appearance when consistent with the character.',
-    'Keep one identifiable main subject in head-and-upper-body framing.',
-  ].join(' ');
+    'Real animals keep normal breed anatomy. One identifiable main subject in head-and-upper-body framing.',
+    !/^(human|person)$/.test(subject.species.toLowerCase()) && 'Never humanize an animal unless explicitly requested.',
+  ].filter(Boolean).join(' ');
   // Bound data rather than chopping off essential rendering directions mid-sentence.
   const factsBudget = Math.max(0, portraitGenerationPromptMaximumLength - directions.length - 24);
   return `${directions} Binding subject facts: ${portraitSafeText(facts, factsBudget)}`;
@@ -1437,7 +1437,7 @@ function portraitEditPrompt(subject, requestedChange) {
   const change = portraitSafeText(requestedChange, 320);
   if (!change) throw new Error('Describe the appearance change to make.');
   const styleDirection = subject.style === 'stylized'
-    ? 'Keep the exact polished semi-realistic digital life-simulator portrait style. It must remain softly illustrated rather than photographed, with believable anatomy, gently simplified skin and hair textures, clean digital rendering, soft natural light, and subtle expressive warmth. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot or caricature. Preserve the named character\'s recognizable design and species.'
+    ? 'Keep the exact polished semi-realistic digital life-simulator portrait style. It must remain softly illustrated rather than photographed, with believable anatomy, gently simplified skin and hair textures, clean digital rendering and natural light. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot or caricature. Preserve the named character\'s recognizable design and species.'
     : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
   return [
     portraitAgeAppearanceDirective(subject),
@@ -1445,6 +1445,7 @@ function portraitEditPrompt(subject, requestedChange) {
     'The exact chronological age is the highest-priority visual fact. If image 0 looks older or younger, correct it completely rather than preserving that incorrect apparent age.',
     'Edit image 0 and keep it as the exact same character.',
     `Apply this requested appearance change: ${change}.`,
+    `Current condition: ${portraitSafeText(subject.conditionDescription, 350) || 'use the supplied life facts'}. Own life context: ${portraitSafeText(subject.subjectDescription, 200)}.`,
     subject.visualIdentity && `Preserve this character identity: ${portraitSafeText(subject.visualIdentity, 180)}.`,
     subject.familyIdentity && `Preserve these inherited family traits: ${portraitSafeText(subject.familyIdentity, 180)}.`,
     'Match that exact age rather than only the broad life stage. A person in their twenties must look like a young adult, not middle-aged or elderly; do not add older-age cues unless the exact age or requested appearance requires them. For animals, interpret age using the exact species or breed\'s natural lifespan.',
@@ -1453,10 +1454,8 @@ function portraitEditPrompt(subject, requestedChange) {
       : 'Preserve identity, facial structure, exact species or breed, natural anatomy, pose, crop, proportions, realistic texture, lighting, clothing unless requested, and background.',
     'For a real animal, preserve its exact breed and normal animal anatomy. Keep its natural skull, muzzle or beak, paws or hooves, limbs, fur, feathers, scales, posture, and body plan. Never add human facial structure, skin, hair, hands, shoulders, torso, clothing, upright human posture, mascot features, or hybrid anatomy unless the life facts explicitly require an anthropomorphic character.',
     styleDirection,
-    subject.role === 'player'
-      ? 'Use an expression appropriate to the scene; never force a smile during danger or distress.'
-      : 'Use a normal, relaxed, slightly happy expression and healthy rested appearance. Do not make the subject sad, exhausted, distressed unless requested.',
-    'Change only what the request requires. Keep exactly one centered forward-facing subject. No text, labels, logos, borders, UI, or extra people.',
+    'Update expression and physical condition to match the current life facts, even if the reference looks happy or healthy. Never force a smile during danger, captivity, grief or distress. Depict stated illness, deprivation and exhaustion respectfully, without graphic wounds; do not transfer another person\'s condition onto this subject.',
+    'Change only what the request and current state require. Keep exactly one centered subject. No text, labels, logos, borders, UI, or extra people.',
   ].filter(Boolean).join(' ');
 }
 

@@ -250,6 +250,7 @@ test('portrait keys include every normalized subject field, operation, change, p
     role: 'friend', species: 'elf', location: 'London', era: 'future', occupation: 'artist',
     subject_description: 'Other history', appearance_description: 'Long hair',
     visual_identity: 'Green eyes', family_identity: 'Other inherited traits', style: 'realistic',
+    condition_description: 'Malnourished and exhausted', scene_description: 'Waiting in a hospital ward',
   })) {
     assert.notEqual(key, portraitRequestKey('player-one', normalizePortraitSubject({ ...body, [field]: value }),
       'edit', 'short hair', reference), field);
@@ -557,7 +558,7 @@ test('portrait prompts preserve young and middle-aged parent appearances', () =>
     species: 'person',
   });
   const middlePrompt = portraitGenerationPrompt(middleAgedParent);
-  assert.match(middlePrompt, /healthy middle adult/i);
+  assert.match(middlePrompt, /middle-aged adult/i);
   assert.match(middlePrompt, /do not make them look elderly/i);
 
   const editedPrompt = portraitEditPrompt(youngParent, 'trim their hair');
@@ -587,21 +588,38 @@ test('portrait prompts lock newborn age before all potentially conflicting facts
   assert.doesNotMatch(prompt, /elderly mother stands beside the crib/i);
 });
 
-test('portrait prompts request normal slightly happy and rested expressions', () => {
+test('portrait prompts never prescribe happy and healthy expressions regardless of context', () => {
   const subject = normalizePortraitSubject({
     profile_id: 'positive-expression-profile',
     age: 34,
     species: 'person',
   });
   const generatedPrompt = portraitGenerationPrompt(subject);
-  assert.match(generatedPrompt, /normal, relaxed, slightly happy expression/i);
-  assert.match(generatedPrompt, /healthy rested appearance/i);
-  assert.match(generatedPrompt, /when consistent with the character/i);
+  assert.match(generatedPrompt, /No automatic smile/i);
+  assert.match(generatedPrompt, /this subject's circumstances/i);
+  assert.doesNotMatch(generatedPrompt, /slightly happy|healthy middle adult/i);
 
   const editedPrompt = portraitEditPrompt(subject, 'make their hair shorter');
-  assert.match(editedPrompt, /normal, relaxed, slightly happy expression/i);
-  assert.match(editedPrompt, /healthy rested appearance/i);
-  assert.match(editedPrompt, /do not make the subject sad, exhausted, distressed/i);
+  assert.match(editedPrompt, /even if the reference looks happy or healthy/i);
+  assert.doesNotMatch(editedPrompt, /slightly happy|Do not make the subject sad/i);
+});
+
+test('prisoner and sick relationship portraits retain their actual condition in both image paths', () => {
+  for (const role of ['player', 'father']) {
+    const subject = normalizePortraitSubject({ profile_id: 'camp-prisoner', role, age: 29, species: 'human',
+      location: 'A concentration camp, occupied Poland', era: '1944',
+      subject_description: 'A camp prisoner enduring forced labor and inadequate rations.',
+      condition_description: 'Malnourished, exhausted, frightened. A fever and a healing cut.',
+      scene_description: 'Waiting for roll call in worn camp clothing.' });
+    for (const prompt of [portraitGenerationPrompt(subject), portraitEditPrompt(subject, 'update the portrait')]) {
+      assert.match(prompt, /Malnourished, exhausted, frightened/);
+      assert.match(prompt, /healing cut/);
+      assert.match(prompt, /unmistakably young adult/);
+      assert.match(prompt, /respectfully, without graphic wounds/);
+      assert.doesNotMatch(prompt, /slightly happy|healthy middle adult/);
+    }
+    assert.ok(portraitGenerationPrompt(subject).length <= 2_000);
+  }
 });
 
 test('player portraits show the current scene instead of a studio background', () => {
