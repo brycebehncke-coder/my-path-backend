@@ -50,6 +50,7 @@ import {
   portraitLifeStage,
   portraitEstimatedCostUSD,
   portraitRequestKey,
+  proxyChatCompletion,
   recordAIContentReport,
   routeForModel,
   validatePlayIntegrityVerdict,
@@ -80,6 +81,63 @@ function portraitProviderResponse(status = 200, message = '') {
 }
 
 const flushPortraitPromises = () => new Promise((resolve) => setImmediate(resolve));
+
+test('Ask recovers an empty reasoning-only result once with the same question and accurate usage', async () => {
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const body = { model: 'gpt-5-mini', prompt_cache_key: 'my-path-life-question-v2', max_tokens: 2_000,
+    messages: [{ role: 'user', content: 'Tell me my life story.' }] };
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return Response.json(requests.length === 1
+      ? { choices: [{ message: { content: '' }, finish_reason: 'length' }],
+          usage: { prompt_tokens: 500, completion_tokens: 2_000, total_tokens: 2_500,
+            completion_tokens_details: { reasoning_tokens: 2_000 } } }
+      : { choices: [{ message: { content: 'You grow up by the sea and become an architect.' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 500, completion_tokens: 1_500, total_tokens: 2_000,
+            completion_tokens_details: { reasoning_tokens: 128 } } });
+  };
+  try {
+    const result = await proxyChatCompletion(body, routeForModel('gpt-5-mini'));
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].max_completion_tokens, 4_000);
+    assert.deepEqual(requests[1].messages, body.messages);
+    assert.equal(requests[1].model, 'gpt-5-mini');
+    assert.equal(result.payload.usage.total_tokens, 4_500);
+    assert.equal(result.payload.usage.completion_tokens_details.reasoning_tokens, 2_128);
+    assert.match(result.payload.choices[0].message.content, /architect/);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Ask recovery does not repeat usable text, refusals, or unrelated requests', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [cacheKey, content, refusal] of [
+      ['my-path-life-question-v2', 'Your grandmother teaches you to sail.', null],
+      ['my-path-life-question-v2', '', 'Unable to answer that request.'],
+      ['some-other-task', '', null],
+    ]) {
+      let calls = 0;
+      globalThis.fetch = async () => { calls += 1; return Response.json({
+        choices: [{ message: { content, refusal }, finish_reason: 'length' }],
+      }); };
+      await proxyChatCompletion({ prompt_cache_key: cacheKey, max_tokens: 2_000, messages: [] }, routeForModel('gpt-5-mini'));
+      assert.equal(calls, 1);
+    }
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Ask recovery stops after two empty responses instead of looping', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return Response.json({
+    choices: [{ message: { content: '' }, finish_reason: 'length' }],
+  }); };
+  try {
+    await proxyChatCompletion({ prompt_cache_key: 'my-path-life-question-v2', max_tokens: 900, messages: [] }, routeForModel('gpt-5-mini'));
+    assert.equal(calls, 2);
+  } finally { globalThis.fetch = originalFetch; }
+});
 
 test('custom life schema settles identity and cast before writing the story without changing its fields', () => {
   const field = { type: 'string' };

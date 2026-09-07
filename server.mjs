@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'portrait-v15-contextual-condition';
+const backendRevision = 'portrait-v15-ask-recovery';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -2227,6 +2227,19 @@ function mergedUsage(firstUsage, secondUsage) {
   if (Object.keys(promptDetails).length > 0) {
     merged.prompt_tokens_details = promptDetails;
   }
+  const completionDetails = {
+    ...(firstUsage?.completion_tokens_details || {}),
+    ...(secondUsage?.completion_tokens_details || {}),
+  };
+  for (const field of ['reasoning_tokens', 'audio_tokens', 'accepted_prediction_tokens', 'rejected_prediction_tokens']) {
+    if (firstUsage?.completion_tokens_details?.[field] != null || secondUsage?.completion_tokens_details?.[field] != null) {
+      completionDetails[field] = Number(firstUsage?.completion_tokens_details?.[field] || 0)
+        + Number(secondUsage?.completion_tokens_details?.[field] || 0);
+    }
+  }
+  if (Object.keys(completionDetails).length > 0) {
+    merged.completion_tokens_details = completionDetails;
+  }
   return merged;
 }
 
@@ -2300,7 +2313,19 @@ async function proxyChatCompletion(body, route) {
   }
 
   let retryBody;
-  if (route.kind === 'deepseek' && deepSeekResponseNeedsRetry(first.payload, forwarded)) {
+  const choice = first.payload?.choices?.[0];
+  if (isOpenAIReasoningRoute(route)
+      && forwarded.prompt_cache_key === 'my-path-life-question-v2'
+      && choice?.finish_reason === 'length'
+      && !String(choice?.message?.content || '').trim()
+      && !choice?.message?.refusal) {
+    // Minimal reasoning can consume the entire allowance before the first word.
+    // Recover once, without changing the question or adding story rules.
+    retryBody = {
+      ...forwarded,
+      max_completion_tokens: Math.min(6_000, Number(forwarded.max_completion_tokens || 900) + 2_000),
+    };
+  } else if (route.kind === 'deepseek' && deepSeekResponseNeedsRetry(first.payload, forwarded)) {
     const retryInstruction = forwarded.response_format?.type === 'json_object'
       ? 'The prior generation was empty or invalid. Return the complete valid JSON object now.'
       : 'The prior generation was empty. Return a complete non-empty answer now.';
@@ -2994,6 +3019,7 @@ export {
   portraitLifeStage,
   portraitEstimatedCostUSD,
   portraitRequestKey,
+  proxyChatCompletion,
   playerQuotaHash,
   playerQuotaReceipt,
   playerQuotaUTCDateKey,
