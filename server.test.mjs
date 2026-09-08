@@ -595,9 +595,9 @@ test('portrait generation prompts stay within the Cloudflare 2048-character cont
   assert.match(prompt, /exact chronological age: 29 years old/i);
   assert.match(prompt, /authoritative individual identity:/i);
   assert.match(prompt, /binding biological family inheritance:/i);
-  assert.match(prompt, /species-age lock/i);
-  assert.match(prompt, /real animals keep normal breed anatomy/i);
-  assert.match(prompt, /no words, labels, logos/i);
+  assert.match(prompt, /form-age lock/i);
+  assert.match(prompt, /real animals retain their natural anatomy/i);
+  assert.match(prompt, /no text, labels, borders/i);
 });
 
 test('portrait prompts preserve young and middle-aged parent appearances', () => {
@@ -745,7 +745,7 @@ test('fictional portraits preserve distinct species and do not use human aging f
   ]) {
     const subject = normalizePortraitSubject({profile_id: name.replace(/[^a-z0-9]/gi, '-'), name, species, age: 100, visual_identity: visual});
     const prompt = portraitGenerationPrompt(subject);
-    assert.match(prompt, /species-age lock/i);
+    assert.match(prompt, /form-age lock/i);
     assert.ok(prompt.includes(name));
     assert.ok(prompt.includes(species));
     assert.ok(prompt.includes(visual));
@@ -773,14 +773,13 @@ test('portrait subjects preserve unusual custom-life species without accepting p
   assert.equal(subject.revision, 2);
   assert.match(portraitGenerationPrompt(subject), /sea dragon/);
   const prompt = portraitGenerationPrompt(subject);
-  assert.match(prompt, /one identifiable main subject in head-and-upper-body framing/i);
-  assert.match(prompt, /highly realistic lifelike portrait/i);
+  assert.match(prompt, /frame the actual whole form/i);
+  assert.match(prompt, /highly realistic image/i);
   assert.match(prompt, /exact chronological age: 9 years old/i);
-  assert.match(prompt, /natural textures and lighting/i);
+  assert.match(prompt, /natural material textures and lighting/i);
   assert.match(prompt, /exact species or breed/i);
-  assert.match(prompt, /real animals keep normal breed anatomy/i);
-  assert.match(prompt, /never humanize an animal unless explicitly requested/i);
-  assert.match(prompt, /not a human actor/i);
+  assert.match(prompt, /real animals retain their natural anatomy/i);
+  assert.match(prompt, /never replace its form with human anatomy/i);
   assert.throws(
     () => normalizePortraitSubject({ profile_id: '../unsafe', age: 20 }),
     /profile_id/i,
@@ -803,7 +802,7 @@ test('young nonhuman characters retain their species instead of becoming human c
   assert.match(prompt, /exactly 10 as a orc/i);
   assert.match(prompt, /moss-green skin, amber eyes/i);
   assert.match(prompt, /binding biological family inheritance/i);
-  assert.match(prompt, /softly illustrated rather than photographed/i);
+  assert.match(prompt, /softly illustrated image/i);
   assert.match(prompt, /orc/i);
   assert.doesNotMatch(prompt, /10 years old \(child\)|fantasy child/i);
 });
@@ -811,6 +810,28 @@ test('young nonhuman characters retain their species instead of becoming human c
 test('portrait list-price estimates distinguish generation from editing', () => {
   assert.equal(portraitEstimatedCostUSD('generation'), 0.000287);
   assert.equal(portraitEstimatedCostUSD('edit'), 0.000346);
+});
+
+test('faceless forms stay faceless while explicit fictional anatomy is preserved', () => {
+  for (const species of ['granite rock', 'oak tree', 'river', 'asteroid', 'chair']) {
+    const subject = normalizePortraitSubject({
+      profile_id: species.replaceAll(' ', '-'), species, age: 4_500_000_000,
+      gender: 'No gender', visual_identity: `An ordinary ${species} in its natural setting.`,
+    });
+    assert.equal(subject.age, 4_500_000_000);
+    const prompt = portraitGenerationPrompt(subject);
+    assert.ok(prompt.length <= 2_000);
+    assert.match(prompt, /NO invented face, eyes, mouth/i);
+    assert.match(prompt, /being playable, conscious, named or addressed as you does not make something anthropomorphic/i);
+    assert.doesNotMatch(prompt, /one identifiable main subject in head-and-upper-body framing/i);
+    const edit = portraitEditPrompt(subject, 'update the scene');
+    assert.match(edit, /REMOVE any invented face, eyes, mouth/i);
+    assert.match(edit, /do not preserve a mistaken face as identity/i);
+  }
+  const shrek = normalizePortraitSubject({profile_id: 'shrek', species: 'ogre', name: 'Shrek',
+    visual_identity: 'The established green ogre with his recognizable broad face and tubular ears.'});
+  assert.match(portraitGenerationPrompt(shrek), /established fictional character/i);
+  assert.match(portraitGenerationPrompt(shrek), /recognizable broad face/i);
 });
 
 test('portrait editing applies only the requested appearance change to image zero', () => {

@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'portrait-v15-ask-recovery';
+const backendRevision = 'portrait-v16-physical-form';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1322,7 +1322,7 @@ function normalizePortraitSubject(body) {
     throw new Error('A valid profile_id is required.');
   }
   const age = Number.isFinite(Number(body.age))
-    ? Math.max(0, Math.min(10_000, Math.floor(Number(body.age))))
+    ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.floor(Number(body.age))))
     : 0;
   const revision = Number.isFinite(Number(body.revision))
     ? Math.max(0, Math.min(10_000, Math.floor(Number(body.revision))))
@@ -1361,7 +1361,7 @@ function portraitAgeAppearanceDirective(subject) {
   const age = Math.max(0, Number(subject.age) || 0);
   const species = portraitSafeText(subject.species, 100).toLowerCase();
   if (species && !/^(human|person)(\b|$)/.test(species)) {
-    return `Species-age lock: exactly ${age} as a ${portraitSafeText(species, 48)}. Use its anatomy and lifespan, not human age stages. At zero show its newborn or newly created form. Never replace its species with human anatomy.`;
+    return `Form-age lock: exactly ${age} as a ${portraitSafeText(species, 48)}. Use its own growth, lifespan or material weathering, never human age stages. An ageless object stays that object, not an infant or elderly human. Never replace its form with human anatomy.`;
   }
   if (age === 0) {
     return 'AGE 0 NEWBORN LOCK: render an unmistakable newborn infant under one month old with newborn head-to-body proportions, a very small body, soft round newborn features, sparse fine baby hair, and age-appropriate swaddling or infant clothing. The newborn cannot sit, stand, pose like an older child, wear makeup or jewelry, have an adult hairstyle, or look like a toddler, child, teen, adult, or elderly person.';
@@ -1408,6 +1408,22 @@ function portraitVisualFacts(subject) {
 
 function portraitGenerationPrompt(subject) {
   const facts = portraitVisualFacts(subject);
+  if (!/^(human|person)$/.test(subject.species.toLowerCase())) {
+    const directions = [
+      `Depict one ${portraitSafeText(subject.species, 80)} as the main subject, with its actual physical form.`,
+      'Objects, rocks, plants, landscapes and other faceless forms have NO invented face, eyes, mouth, head, limbs or clothing. Being playable, conscious, named or addressed as you does not make something anthropomorphic. Only an explicitly described anthropomorphic design or an established fictional character may have those features. Real animals retain their natural anatomy.',
+      'Frame the actual whole form or a useful natural detail, never force head-and-shoulders framing. Ignore generic human gender, hair, eye, complexion and inherited-family defaults that do not apply to this form.',
+      portraitAgeAppearanceDirective(subject),
+      `Current setting: ${portraitSafeText(subject.location, 80)}. ${portraitSafeText(subject.sceneDescription || subject.subjectDescription, 150)}.`,
+      'Reflect the actual physical condition without inventing facial expressions or a smile.',
+      subject.style === 'stylized'
+        ? 'Semi-realistic softly illustrated image with natural textures and lighting, not a cartoon mascot.'
+        : 'Highly realistic image with natural material textures and lighting.',
+      'No text, labels, borders, UI or extra subjects.',
+    ].join(' ');
+    const factsBudget = Math.max(0, portraitGenerationPromptMaximumLength - directions.length - 24);
+    return `${directions} Binding subject facts: ${portraitSafeText(facts, factsBudget)}`;
+  }
   const styleDirection = subject.style === 'stylized'
     ? 'Create one polished semi-realistic digital life-simulator portrait, softly illustrated rather than photographed, with gently simplified textures and natural lighting. Preserve the named character\'s recognizable design and species; do not reinterpret it as a human.'
     : 'Create one highly realistic lifelike portrait with natural textures and lighting. Preserve the named character\'s recognizable design and species, not a human actor.';
@@ -1436,6 +1452,20 @@ function portraitGenerationPrompt(subject) {
 function portraitEditPrompt(subject, requestedChange) {
   const change = portraitSafeText(requestedChange, 320);
   if (!change) throw new Error('Describe the appearance change to make.');
+  if (!/^(human|person)$/.test(subject.species.toLowerCase())) {
+    return [
+      `Edit image 0 to show this exact subject: ${portraitVisualFacts(subject)}.`,
+      `Requested change: ${change}.`,
+      'The stated physical form overrides errors in the reference. For an ordinary object, rock, plant or other faceless form, REMOVE any invented face, eyes, mouth, human anatomy, limbs or clothing from the reference. Do not preserve a mistaken face as identity. Consciousness or being playable does not imply anthropomorphism. Keep facial features only if natural for this species, explicitly requested, or part of its established fictional design. Preserve real animal anatomy.',
+      portraitAgeAppearanceDirective(subject),
+      `Current setting: ${portraitSafeText(subject.location, 120)}, ${portraitSafeText(subject.era, 60)}. Scene: ${portraitSafeText(subject.sceneDescription || subject.subjectDescription, 240)}.`,
+      `Actual physical condition: ${portraitSafeText(subject.conditionDescription, 200)}. Never invent an expression on a faceless form.`,
+      subject.style === 'stylized'
+        ? 'Keep the softly illustrated semi-realistic style and material texture, not a cartoon mascot.'
+        : 'Keep highly realistic natural material textures and lighting.',
+      'Preserve recognizable shape, material and coloring except where the request or current state changes them. Frame its actual form without forcing a head or upper body. One subject; no text, UI, borders or extra subjects.',
+    ].join(' ');
+  }
   const styleDirection = subject.style === 'stylized'
     ? 'Keep the exact polished semi-realistic digital life-simulator portrait style. It must remain softly illustrated rather than photographed, with believable anatomy, gently simplified skin and hair textures, clean digital rendering and natural light. Never make it ultra-photorealistic, camera-like, flat cartoon, anime, chibi, 3D, clay, vector, pixel art, mascot or caricature. Preserve the named character\'s recognizable design and species.'
     : 'Keep the exact highly realistic lifelike AgeUp portrait style. Never simplify it into cartoon, flat illustration, mascot, anime, chibi, vector, clay, toy, emoji, or painterly caricature. The app applies subtle pixelation after editing.';
