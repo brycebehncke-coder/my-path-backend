@@ -5,6 +5,7 @@ import { routeForModel, forwardedChatBody, attachPricingMetadata, proxyChatCompl
 test('GPT-6 Luna preserves chat contracts, budgets, cache keys and uses no reasoning', () => {
   const route = routeForModel('gpt-6-luna');
   assert.equal(route.provider, 'OpenAI');
+  assert.equal(route.healthURL, 'https://api.openai.com/v1/models/gpt-6-luna');
   for (const max_tokens of [500, 750, 1000, 2400]) {
     for (const reasoning_effort of [undefined, 'minimal', 'medium']) {
       const request = { model: 'gpt-6-luna', max_tokens, reasoning_effort,

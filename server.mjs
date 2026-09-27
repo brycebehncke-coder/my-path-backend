@@ -168,7 +168,7 @@ const modelRoutes = new Map([
     missingKeyName: 'OPENAI_API_KEY',
     upstreamModel: 'gpt-6-luna',
     chatURL: 'https://api.openai.com/v1/chat/completions',
-    healthURL: 'https://api.openai.com/v1/models',
+    healthURL: 'https://api.openai.com/v1/models/gpt-6-luna',
   }],
   ['deepseek-v4-pro', {
     kind: 'deepseek',
