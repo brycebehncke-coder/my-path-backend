@@ -12,7 +12,7 @@ import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'portrait-v16-physical-form';
+const backendRevision = 'gpt6-luna-default-v1';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -161,6 +161,15 @@ const modelRoutes = new Map([
     chatURL: 'https://api.openai.com/v1/chat/completions',
     healthURL: 'https://api.openai.com/v1/models',
   }],
+  ['gpt-6-luna', {
+    kind: 'openai-gpt6',
+    provider: 'OpenAI',
+    apiKey: openaiApiKey,
+    missingKeyName: 'OPENAI_API_KEY',
+    upstreamModel: 'gpt-6-luna',
+    chatURL: 'https://api.openai.com/v1/chat/completions',
+    healthURL: 'https://api.openai.com/v1/models',
+  }],
   ['deepseek-v4-pro', {
     kind: 'deepseek',
     provider: 'DeepSeek',
@@ -182,11 +191,12 @@ function routeForModel(rawModel) {
 }
 
 function isOpenAIReasoningRoute(route) {
-  return route?.kind === 'openai-gpt5' || route?.kind === 'openai-gpt56';
+  return route?.kind === 'openai-gpt5' || route?.kind === 'openai-gpt56' || route?.kind === 'openai-gpt6';
 }
 
 function compatibleOpenAIReasoningEffort(route, rawEffort) {
   const requested = typeof rawEffort === 'string' ? rawEffort.trim().toLowerCase() : '';
+  if (route?.kind === 'openai-gpt6') return 'none';
   if (route?.kind === 'openai-gpt56') {
     const supported = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
     return supported.has(requested) ? requested : 'none';
@@ -2830,8 +2840,8 @@ const server = createServer(async (req, res) => {
 
     if (req.method === 'GET' && (url.pathname === '/v1/health/ai' || url.pathname === '/v1/health/openai')) {
       const requestedModel = url.pathname === '/v1/health/openai'
-        ? 'gpt-4o-mini'
-        : normalizeModelName(url.searchParams.get('model') || 'gpt-4o-mini');
+        ? 'gpt-6-luna'
+        : normalizeModelName(url.searchParams.get('model') || 'gpt-6-luna');
       const route = routeForModel(requestedModel);
 
       if (!route) {
