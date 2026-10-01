@@ -29,6 +29,48 @@ test('Apple form callback is signed, strips code from redirect, and does not bro
   assert.equal((await call(gate,{...args,body:args.body+'&redirect=https://evil.example'})).status,400);
   assert.equal((await call(gate,{...args,path:'/v1/jackpot/command'})).status,403);
 });
+test('Apple exchange failures return only fixed safe categories to the game',async()=>{
+  const args={path:'/v1/jackpot/auth/apple/callback',method:'POST',
+    headers:{origin:'https://appleid.apple.com','content-type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({state:'f'.repeat(43),code:'private-authorization-code'}).toString()};
+  for(const [code,reason] of [['INVALID_LOGIN_FLOW','expired'],['APPLE_AUTHORIZATION_REJECTED','rejected'],
+    ['INVALID_APPLE_IDENTITY','rejected'],['INVALID_IDENTITY_TOKEN','rejected'],
+    ['APPLE_CALLBACK_ALREADY_RECEIVED','restart'],['APPLE_SIGN_IN_RESTART_REQUIRED','restart'],
+    ['APPLE_SIGN_IN_CONFIG_REQUIRED','unavailable'],['AUTH_RATE_LIMITED','unavailable'],['untrusted-provider-secret','unavailable']]) {
+    const gate=createJackpotGateway({env,fetcher:async()=>Response.json({error:{code,description:'private-provider-details'}},{status:401})});
+    const result=await call(gate,args);
+    assert.equal(result.status,303);
+    assert.equal(result.headers.Location,env.JACKPOT_WEBSITE_ORIGIN+'/games/jackpot-inc/play/?signin=apple-failed&reason='+reason);
+    assert.equal(result.headers['Referrer-Policy'],'no-referrer');
+    assert.equal(result.headers['Access-Control-Allow-Origin'],undefined);
+    assert(!JSON.stringify(result).includes('private'));assert(!JSON.stringify(result).includes(code));
+    assert.equal(result.body,null);
+  }
+});
+test('valid Apple navigation returns to game after timeout, broken JSON or network failure',async()=>{
+  const args={path:'/v1/jackpot/auth/apple/callback',method:'POST',
+    headers:{'content-type':'application/x-www-form-urlencoded'},
+    body:new URLSearchParams({state:'s'.repeat(43),code:'private-code'}).toString()};
+  for(const fetcher of [async()=>new Promise(()=>{}),async()=>({status:200,json:()=>new Promise(()=>{})}),
+    async()=>new Response('invalid upstream response'),async()=>{throw Error('private-provider-details');}]) {
+    const gate=createJackpotGateway({env,timeoutMs:15,fetcher});const result=await call(gate,args);
+    assert.equal(result.status,303);
+    assert.equal(result.headers.Location,env.JACKPOT_WEBSITE_ORIGIN+'/games/jackpot-inc/play/?signin=apple-failed&reason=unavailable');
+    assert.equal(result.body,null);assert(!JSON.stringify(result).includes('private'));
+  }
+});
+test('Apple cancellation stays distinct from provider failure and never reflects errors',async()=>{
+  const gate=createJackpotGateway({env,fetcher:()=>assert.fail('error callbacks never exchange a code')});
+  const args={path:'/v1/jackpot/auth/apple/callback',method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'}};
+  for(const [error,result] of [['user_cancelled_authorize','apple-cancelled'],['access_denied','apple-cancelled'],
+    ['invalid_client','apple-failed&reason=rejected'],['server_error','apple-failed&reason=unavailable'],
+    ['temporarily_unavailable','apple-failed&reason=unavailable'],['secret-error-text','apple-failed&reason=rejected']]) {
+    const response=await call(gate,{...args,body:new URLSearchParams({state:'s'.repeat(43),error}).toString()});
+    assert.equal(response.status,303);
+    assert.equal(response.headers.Location,env.JACKPOT_WEBSITE_ORIGIN+'/games/jackpot-inc/play/?signin='+result);
+    assert(!JSON.stringify(response).includes(error));
+  }
+});
 test('forwards only approved paths, signs token/body, and strips upstream cookies',async()=>{
   let sent;
   const gate=createJackpotGateway({env,clock:()=>at,fetcher:async(url,init)=>{sent={url,init};return Response.json({balance:'123'},{headers:{'Set-Cookie':'bad=cookie'}});}});

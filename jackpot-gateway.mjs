@@ -6,6 +6,12 @@ const METHODS = new Map([['config','GET'],['account','GET'],['auth/challenge','P
   ['auth/complete','POST'],['auth/logout','POST'],['auth/apple/callback','POST'],['auth/apple/exchange','POST'],['account/delete','POST'],['command','POST'],
   ['account/legacy-status','POST'],['account/migrate-legacy','POST'],['account/adopt-online','POST'],['native/acquire','POST'],['native/checkpoint','POST'],['native/release','POST'],['native/recover','POST']]);
 const digest = body => createHash('sha256').update(body).digest('hex');
+function appleFailureReason(code) {
+  if (code==='INVALID_LOGIN_FLOW') return 'expired';
+  if (['APPLE_AUTHORIZATION_REJECTED','INVALID_APPLE_IDENTITY','INVALID_IDENTITY_TOKEN'].includes(code)) return 'rejected';
+  if (['APPLE_CALLBACK_ALREADY_RECEIVED','APPLE_SIGN_IN_RESTART_REQUIRED'].includes(code)) return 'restart';
+  return 'unavailable';
+}
 export function bridgeSignature(secret,{timestamp,method,path,authorization='',clientKey,body}) {
   return createHmac('sha256',secret).update(JSON.stringify(['jackpot-bridge-v1',timestamp,method,path,authorization,clientKey,digest(body)])).digest('hex');
 }
@@ -21,6 +27,13 @@ export function createJackpotGateway({env=process.env,fetcher=fetch,clock=Date.n
     const origin=req.headers.origin;
     const allowedOrigin=env.JACKPOT_WEBSITE_ORIGIN || 'https://behnckemobilegames.com';
     const appleCallback=url.pathname===PREFIX+'auth/apple/callback';
+    const returnFromApple=(result,reason)=>{
+      const target=new URL('/games/jackpot-inc/play/',allowedOrigin);
+      target.searchParams.set('signin',result);
+      if(reason)target.searchParams.set('reason',reason);
+      res.writeHead(303,{'Location':target.href,'Cache-Control':'no-store','Referrer-Policy':'no-referrer'});
+      res.end();return true;
+    };
     // Apple's form_post is a navigation, not an expansion of API CORS. It has
     // no session cookie; stored unpredictable state + signed nonce bind proof.
     if (origin && origin !== (appleCallback ? 'https://appleid.apple.com' : allowedOrigin)) return send(403,{error:{code:'ORIGIN_NOT_ALLOWED'}});
@@ -50,6 +63,7 @@ export function createJackpotGateway({env=process.env,fetcher=fetch,clock=Date.n
     const controller=new AbortController();
     const timer=setTimeout(()=>controller.abort(),timeoutMs);
     const deadline=new Promise((_,reject)=>controller.signal.addEventListener('abort',()=>reject(Error('timeout')),{once:true}));
+    let validAppleNavigation=false;
     try {
       const chunks=[];let bytes=0;
       // The separate body deadline prevents slow clients from retaining the
@@ -65,9 +79,12 @@ export function createJackpotGateway({env=process.env,fetcher=fetch,clock=Date.n
           || !/^[A-Za-z0-9_-]{43}$/.test(form.get('state') || '')) return send(400,{error:{code:'INVALID_APPLE_CALLBACK'}});
         if (form.has('error')) {
           // No reflection of provider data or user-controlled redirect target.
-          res.writeHead(303,{'Location':new URL('/games/jackpot-inc/play/?signin=apple-cancelled',allowedOrigin).href,'Cache-Control':'no-store','Referrer-Policy':'no-referrer'});res.end();return true;
+          if (['user_cancelled_authorize','access_denied'].includes(form.get('error')))
+            return returnFromApple('apple-cancelled');
+          return returnFromApple('apple-failed',['server_error','temporarily_unavailable'].includes(form.get('error'))?'unavailable':'rejected');
         }
         if (!form.get('code')) return send(400,{error:{code:'INVALID_APPLE_CALLBACK'}});
+        validAppleNavigation=true;
         raw=JSON.stringify({flowId:form.get('state'),code:form.get('code')});
       } else if (method==='POST' && contentType!=='application/json') return send(415,{error:{code:'JSON_REQUIRED'}});
       const authorization=req.headers.authorization || '';
@@ -88,10 +105,16 @@ export function createJackpotGateway({env=process.env,fetcher=fetch,clock=Date.n
       const payload=await Promise.race([response.json(),deadline]);
       if (appleCallback) {
         const result=response.status===200 && payload.received===true ? 'apple-return' : 'apple-failed';
-        res.writeHead(303,{'Location':new URL(`/games/jackpot-inc/play/?signin=${result}`,allowedOrigin).href,'Cache-Control':'no-store','Referrer-Policy':'no-referrer'});res.end();return true;
+        return returnFromApple(result,result==='apple-failed'?appleFailureReason(payload?.error?.code):undefined);
       }
       return send(response.status,payload);
-    } catch(error) {return send(error.message==='body-limit'?413:503,{error:{code:error.message==='body-limit'?'REQUEST_TOO_LARGE':'ACCOUNTS_TEMPORARILY_UNAVAILABLE'}});}
+    } catch(error) {
+      // A valid form_post is a browser navigation. Even a provider/network
+      // failure must return to the game with an actionable, non-sensitive code,
+      // rather than strand the player on a raw gateway JSON error page.
+      if(validAppleNavigation)return returnFromApple('apple-failed','unavailable');
+      return send(error.message==='body-limit'?413:503,{error:{code:error.message==='body-limit'?'REQUEST_TOO_LARGE':'ACCOUNTS_TEMPORARILY_UNAVAILABLE'}});
+    }
     finally {clearTimeout(timer);inFlight-=1;}
   };
 }
