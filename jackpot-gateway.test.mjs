@@ -61,7 +61,7 @@ test('native save limit is isolated to its exact authenticated upstream route',a
   const gate=createJackpotGateway({env,fetcher:async()=>{forwarded++;return Response.json({ok:true});}});
   const args={method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+'n'.repeat(43)},body:JSON.stringify({save:'x'.repeat(30_000)})};
   assert.equal((await call(gate,{...args,path:'/v1/jackpot/native/checkpoint'})).status,200);
-  for(const route of ['command','native/acquire','native/release','account/migrate-legacy'])
+  for(const route of ['command','native/acquire','native/release','account/migrate-legacy','account/adopt-online'])
     assert.equal((await call(gate,{...args,path:'/v1/jackpot/'+route})).status,413);
   assert.equal((await call(gate,{...args,path:'/v1/jackpot/native/checkpoint',body:'x'.repeat(160_001)})).status,413);
   assert.equal(forwarded,1);

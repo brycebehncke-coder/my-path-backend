@@ -4,7 +4,7 @@ import { isIP } from 'node:net';
 const PREFIX = '/v1/jackpot/';
 const METHODS = new Map([['config','GET'],['account','GET'],['auth/challenge','POST'],
   ['auth/complete','POST'],['auth/logout','POST'],['auth/apple/callback','POST'],['auth/apple/exchange','POST'],['account/delete','POST'],['command','POST'],
-  ['account/legacy-status','POST'],['account/migrate-legacy','POST'],['native/acquire','POST'],['native/checkpoint','POST'],['native/release','POST']]);
+  ['account/legacy-status','POST'],['account/migrate-legacy','POST'],['account/adopt-online','POST'],['native/acquire','POST'],['native/checkpoint','POST'],['native/release','POST']]);
 const digest = body => createHash('sha256').update(body).digest('hex');
 export function bridgeSignature(secret,{timestamp,method,path,authorization='',clientKey,body}) {
   return createHmac('sha256',secret).update(JSON.stringify(['jackpot-bridge-v1',timestamp,method,path,authorization,clientKey,digest(body)])).digest('hex');
