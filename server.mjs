@@ -10,6 +10,9 @@ import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
+import { createJackpotGateway } from './jackpot-gateway.mjs';
+
+const jackpotGateway = createJackpotGateway();
 
 const port = Number(process.env.PORT || 3000);
 const backendRevision = 'gpt6-luna-default-v2';
@@ -2447,6 +2450,7 @@ async function checkProviderHealth(route) {
 
 const server = createServer(async (req, res) => {
   try {
+    if (await jackpotGateway(req, res)) return;
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
     if (req.method === 'GET' && url.pathname === '/') {

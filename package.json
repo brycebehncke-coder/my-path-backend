@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --env-file=.env server.mjs",
     "start": "node server.mjs",
-    "test": "node --test server.test.mjs"
+    "test": "node --test server.test.mjs jackpot-gateway.test.mjs"
   },
   "dependencies": {
     "google-auth-library": "^10.3.0",
