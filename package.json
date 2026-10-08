@@ -6,11 +6,17 @@
   "scripts": {
     "dev": "node --env-file=.env server.mjs",
     "start": "node server.mjs",
-    "test": "node --test server.test.mjs jackpot-gateway.test.mjs"
+    "test": "node --test server.test.mjs jackpot-gateway.test.mjs accounts.test.mjs discoveries-routes.test.mjs"
   },
   "dependencies": {
     "google-auth-library": "^10.3.0",
-    "node-app-attest": "1.0.1"
+    "node-app-attest": "1.0.1",
+    "jose": "^6.2.12",
+    "obscenity": "^0.4.6",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
   },
   "engines": {
     "node": ">=20"

@@ -11,11 +11,12 @@ import { pathToFileURL } from 'node:url';
 import { verifyAssertion, verifyAttestation } from 'node-app-attest';
 import { GoogleAuth } from 'google-auth-library';
 import { createJackpotGateway } from './jackpot-gateway.mjs';
+import { AccountError, handleAccountRequest, googleSignInCallback, customLifeReceipt, withDiscoveryTitle } from './accounts.mjs';
 
 const jackpotGateway = createJackpotGateway();
 
 const port = Number(process.env.PORT || 3000);
-const backendRevision = 'gpt6-luna-default-v2';
+const backendRevision = 'ageup-discoveries-shared-d1-v1';
 const openaiApiKey = (process.env.OPENAI_API_KEY || '').trim();
 const deepSeekApiKey = (process.env.DEEPSEEK_API_KEY || '').trim();
 const cloudflareAccountId = (process.env.CLOUDFLARE_ACCOUNT_ID || '').trim();
@@ -1019,6 +1020,7 @@ async function verifyGenuineAppRequest(args) {
   const permitsLocalAIEvaluation = port === 39005
     && process.env.NODE_ENV !== 'production'
     && process.env.MY_PATH_LOCAL_AI_EVAL_BYPASS_APP_ATTEST === '1'
+    && ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(args.req.socket?.remoteAddress)
     && requestHeader(args.req, 'x-my-path-player-id')
       === '00000000-0000-4000-8000-000000000001';
   if (permitsLocalAIEvaluation) {
@@ -1029,13 +1031,10 @@ async function verifyGenuineAppRequest(args) {
     return verifyPlayIntegrityRequest(args);
   }
   if (platform === 'android-debug') {
-    if (process.env.NODE_ENV === 'production') {
-      throw new PlayIntegrityRequestError(
-        'play_integrity_debug_rejected',
-        'Debug Android builds cannot use the production service.',
-      );
-    }
-    return { verified: false, platform: 'android', debug: true };
+    throw new PlayIntegrityRequestError(
+      'play_integrity_debug_rejected',
+      'Debug Android builds cannot use the production service.',
+    );
   }
   return verifyAppAttestRequest(args);
 }
@@ -1916,10 +1915,12 @@ function orderedGameplayResponseFormat(format) {
 
 function forwardedChatBody(body, route) {
   const forwarded = {
-    ...body,
+    ...withDiscoveryTitle(body),
     model: route.upstreamModel,
   };
   delete forwarded.provider;
+  delete forwarded._ageup_request_id;
+  delete forwarded._ageup_custom_life;
   if (forwarded.response_format) {
     forwarded.response_format = orderedGameplayResponseFormat(forwarded.response_format);
   }
@@ -1960,7 +1961,7 @@ function forwardedChatBody(body, route) {
     // generation after the app's loading deadline.
     const jsonInstruction = deepSeekJSONInstructionForBody(forwarded);
     if (jsonInstruction) {
-      forwarded.messages = appendSystemInstruction(body.messages, jsonInstruction);
+      forwarded.messages = appendSystemInstruction(forwarded.messages, jsonInstruction);
       forwarded.response_format = { type: 'json_object' };
     }
   }
@@ -2453,6 +2454,39 @@ const server = createServer(async (req, res) => {
     if (await jackpotGateway(req, res)) return;
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
+    if (req.method === 'GET' && url.pathname === '/v1/accounts/google/callback') {
+      try {
+        const location = await googleSignInCallback(url.searchParams);
+        res.writeHead(303, { Location: location, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+        return res.end();
+      } catch {
+        return sendJson(res, 400, { error: { message: 'Sign-in could not complete. Return to AgeUp and try again.' } }, { 'Cache-Control': 'no-store' });
+      }
+    }
+
+    if (req.method === 'POST' && (url.pathname.startsWith('/v1/accounts/') || url.pathname.startsWith('/v1/custom-lives/'))) {
+      let parsed;
+      try { parsed = await readJsonBody(req, 20000); }
+      catch { return sendJson(res, 400, { error: { message: 'Invalid account request.' } }); }
+      if (!parsed.body || typeof parsed.body !== 'object' || Array.isArray(parsed.body)) {
+        return sendJson(res, 400, { error: { message: 'Invalid account request.' } });
+      }
+      const identity = playerQuotaIdentity(req);
+      try {
+        await verifyGenuineAppRequest({ req, pathname: url.pathname, rawBody: parsed.rawBody, identity, at: new Date() });
+      } catch (error) { return sendGenuineAppError(res, error); }
+      try {
+        const token = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization || '')?.[1];
+        const result = await handleAccountRequest({ path: url.pathname, body: parsed.body,
+          installation: identity.installationHash || identity.hash, token, signingSecret: playerQuotaSigningSecret });
+        return sendJson(res, 200, result, { 'Cache-Control': 'no-store' });
+      } catch (error) {
+        return sendJson(res, error instanceof AccountError ? error.status : 503, { error: {
+          code: error instanceof AccountError ? error.code : 'accounts_unavailable',
+          message: error instanceof AccountError ? error.message : 'Accounts are temporarily unavailable. Your game is unaffected.'
+        } }, { 'Cache-Control': 'no-store' });
+      }
+    }
     if (req.method === 'GET' && url.pathname === '/') {
       return sendJson(res, 200, {
         ok: true,
@@ -2982,11 +3016,23 @@ const server = createServer(async (req, res) => {
         actualTokens,
         new Date(),
       );
+      let lifeReceipt;
+      if (result.status >= 200 && result.status < 300 && body._ageup_custom_life) {
+        try {
+          const choice = result.payload?.choices?.[0];
+          if (choice?.finish_reason === 'stop') lifeReceipt = customLifeReceipt({
+            prompt: body._ageup_custom_life, generation: body._ageup_request_id,
+            content: choice.message?.content, installation: quotaIdentity.installationHash || quotaIdentity.hash,
+            signingSecret: playerQuotaSigningSecret,
+          });
+        } catch { /* A history receipt must never interrupt the story response. */ }
+      }
       return sendJson(
         res,
         result.status,
         result.payload,
-        quotaHeaders(quotaIdentity.hash, quotaDay, quotaSnapshot, quotaAt),
+        { ...quotaHeaders(quotaIdentity.hash, quotaDay, quotaSnapshot, quotaAt),
+          ...(lifeReceipt ? { 'X-AgeUp-Custom-Life-Receipt': lifeReceipt } : {}) },
       );
     }
 
