@@ -1,4 +1,6 @@
 import { createServer } from 'node:http';
+import { createChompRooms } from './chomp-rooms.mjs';
+const chompRooms = createChompRooms();
 import {
   createHash,
   createHmac,
@@ -2451,6 +2453,7 @@ async function checkProviderHealth(route) {
 
 const server = createServer(async (req, res) => {
   try {
+    if (await chompRooms(req, res)) return;
     if (await jackpotGateway(req, res)) return;
     const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
