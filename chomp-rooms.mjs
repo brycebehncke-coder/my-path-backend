@@ -16,26 +16,30 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     }
     for (const [ip, entry] of attempts) if (now() - entry.start > 60000) attempts.delete(ip);
   };
-  function validateSnapshot(s) {
-    if (!s || s.protocol !== 1 || !Number.isFinite(s.elapsed) || !Array.isArray(s.fish) || s.fish.length !== 29 || !Array.isArray(s.food) || s.food.length > 1800 || !Array.isArray(s.circles) || s.circles.length > 12) return false;
+  function validateSnapshot(s, protocol) {
+    if (!s || s.protocol !== protocol || !Number.isFinite(s.elapsed) || !Array.isArray(s.fish) || s.fish.length !== (protocol===2?65:29) || !Array.isArray(s.food) || s.food.length > (protocol===2?6000:1800) || !Array.isArray(s.circles) || s.circles.length > 12) return false;
     if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== 860 || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== 860) return false;
     const finite = n => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 1e12;
     for (let i=0;i<s.fish.length;i++) {
       const f=s.fish[i];
       if (f.id !== i || !f.position || !finite(f.position.x) || !finite(f.position.y) || !Number.isSafeInteger(f.mass) || f.mass<0 || !Number.isSafeInteger(f.capacity) || f.capacity<f.mass || f.capacity>100000000 || typeof f.name!=='string' || f.name.length>32) return false;
     }
+    if(protocol===2) {
+      if(!Array.isArray(s.mines) || s.mines.length>40 || !s.mines.every(m=>Number.isSafeInteger(m.id)&&m.position&&finite(m.position.x)&&finite(m.position.y)))return false;
+      if(!s.food.every(f=>Array.isArray(f)&&f.length===5&&f.every(Number.isSafeInteger)&&f[3]>0&&f[3]<=100000000&&f[4]>=0&&f[4]<=6))return false;
+    }
     return true;
   }
   async function body(req) {
     const chunks=[];let size=0;
-    for await (const chunk of req) { size+=chunk.length;if(size>262144) throw new Error('Request too large');chunks.push(chunk); }
+    for await (const chunk of req) { size+=chunk.length;if(size>786432) throw new Error('Request too large');chunks.push(chunk); }
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   }
   return async function chompRooms(req,res) {
     const path=new URL(req.url || '/', 'http://localhost').pathname;
     if (!path.startsWith('/v1/chomp/')) return false;
     expire();
-    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:1,mode:'private-hosted-playtest',maxPlayers:4});return true;}
+    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:2,compatibleProtocols:[1,2],mode:'private-hosted-playtest',maxPlayers:4});return true;}
     if (req.method!=='POST') {reply(res,405,{error:'Use POST.'});return true;}
     try {
       const b=await body(req);
@@ -45,19 +49,20 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         const entry=attempts.get(ip) || {start:now(),count:0};
         if (entry.count++>=60 || (!attempts.has(ip) && attempts.size>=1024)) {reply(res,429,{error:'Please wait before trying another room.'});return true;}
         attempts.set(ip,entry);
-        if (b.protocol!==1) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
+        if (![1,2].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
         let room,code;
         if (path==='/v1/chomp/rooms') {
           if (rooms.size>=maxRooms) {reply(res,503,{error:'Test rooms are full. Try again shortly.'});return true;}
           do {code=randomBytes(5).toString('hex').toUpperCase();} while(rooms.has(code));
-          room={created:now(),hostSeen:now(),players:new Map(),snapshot:null,revision:0};rooms.set(code,room);
+          room={protocol:b.protocol,created:now(),hostSeen:now(),players:new Map(),snapshot:null,revision:0};rooms.set(code,room);
         } else {code=String(b.code||'').toUpperCase();room=rooms.get(code);}
         if (!room) {reply(res,404,{error:'That room has closed. Ask the host for a new code.'});return true;}
+        if(room.protocol!==b.protocol) {reply(res,409,{error:"Update chomp chomp.io on both phones before joining this room."});return true;}
         const used=new Set([...room.players.values()].map(p=>p.slot));let slot=0;while(used.has(slot))slot++;
         if(slot>=4) {reply(res,409,{error:'This room already has four players.'});return true;}
         const token=randomBytes(32).toString('base64url');
         room.players.set(token,{slot,identity:randomBytes(8).toString("hex"),name:cleanName(b.name),skin:Math.max(0,Math.min(31,Math.floor(Number(b.skin)||0))),seen:now(),lastExchange:0,input:{x:0,y:0,boost:0,chomp:0}});
-        reply(res,200,{code,token,slot,protocol:1});return true;
+        reply(res,200,{code,token,slot,protocol:room.protocol});return true;
       }
       const code=String(b.code||'').toUpperCase(),room=rooms.get(code);
       const token=/^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization||'')?.[1],player=room?.players.get(token);
@@ -73,7 +78,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
       player.input={x:input.x,y:input.y,boost:Math.max(player.input.boost,input.boost),chomp:Math.max(player.input.chomp,input.chomp)};
       if(player.slot===0) {
         room.hostSeen=now();
-        if(b.snapshot) {if(!validateSnapshot(b.snapshot))throw new Error('Invalid world snapshot');room.snapshot=b.snapshot;room.revision++;}
+        if(b.snapshot) {if(!validateSnapshot(b.snapshot,room.protocol))throw new Error('Invalid world snapshot');room.snapshot=b.snapshot;room.revision++;}
       } else if(b.snapshot) {reply(res,403,{error:'Only the host can send the world.'});return true;}
       const players=[...room.players.values()].map(p=>({slot:p.slot,identity:p.identity,name:p.name,skin:p.skin,input:now()-p.seen>1200?{...p.input,x:0,y:0}:p.input}));
       reply(res,200,{revision:room.revision,players,snapshot:player.slot===0?null:room.snapshot});return true;

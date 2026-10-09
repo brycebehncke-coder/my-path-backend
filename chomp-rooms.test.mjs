@@ -18,7 +18,7 @@ const join={name:'Nemo',skin:31,protocol:1},input={x:1,y:0,boost:0,chomp:0};
 const world=()=>({protocol:1,elapsed:0,fish:Array.from({length:29},(_,id)=>({id,name:'Fish',position:{x:10,y:20},mass:64,capacity:64})),food:[],circles:[],surface:{displacement:Array(860).fill(0),velocity:Array(860).fill(0)}});
 test('private rooms carry two players, input and exact host snapshots',async()=>{
  let time=100000;await fixture(async call=>{
-  assert.equal((await call('/v1/chomp/health')).body.protocol,1);
+  assert.equal((await call('/v1/chomp/health')).body.protocol,2);
   const host=(await call('/v1/chomp/rooms',join)).body;
   const guest=(await call('/v1/chomp/join',{...join,name:'Coral',code:host.code})).body;
   assert.equal(guest.slot,1);assert.notEqual(host.token,guest.token);
@@ -63,8 +63,24 @@ test('idle controls stop and host disconnect expires the room',async()=>{
 });
 test('request and admission limits bound memory',async()=>{
  await fixture(async call=>{
-  assert.equal((await call('/v1/chomp/rooms',{...join,padding:'x'.repeat(262144)})).status,400);
+  assert.equal((await call('/v1/chomp/rooms',{...join,padding:'x'.repeat(786432)})).status,400);
   let status=0;for(let i=0;i<65;i++)status=(await call('/v1/chomp/join',{...join,code:'BAD'})).status;
   assert.equal(status,429);
  });
+});
+
+test('protocol 2 dense ocean and hazards relay without breaking old rooms',async()=>{
+ let time=400000;await fixture(async call=>{
+  const h=(await call('/v1/chomp/rooms',{...join,protocol:2})).body;
+  assert.equal((await call('/v1/chomp/join',{...join,code:h.code})).status,409);
+  const g=(await call('/v1/chomp/join',{...join,protocol:2,code:h.code})).body;
+  const snapshot={...world(),protocol:2,fish:Array.from({length:65},(_,id)=>({...world().fish[0],id})),food:Array.from({length:6000},(_,id)=>[id,5000,20000,1,6]),mines:[{id:0,position:{x:20,y:20}}]};
+  assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,200);
+  const received=await call('/v1/chomp/exchange',{code:h.code,input},g.token);
+  assert.equal(received.body.snapshot.mines.length,1);assert.equal(received.body.snapshot.food.length,6000);
+  time+=200;snapshot.mines=Array(41).fill(snapshot.mines[0]);
+  assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,400);
+  const old=(await call('/v1/chomp/rooms',join)).body;
+  assert.equal((await call('/v1/chomp/exchange',{code:old.code,input,snapshot:world()},old.token)).status,200);
+ },{now:()=>time});
 });
