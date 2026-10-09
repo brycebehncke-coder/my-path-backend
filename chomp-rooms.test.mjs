@@ -18,7 +18,7 @@ const join={name:'Nemo',skin:31,protocol:1},input={x:1,y:0,boost:0,chomp:0};
 const world=()=>({protocol:1,elapsed:0,fish:Array.from({length:29},(_,id)=>({id,name:'Fish',position:{x:10,y:20},mass:64,capacity:64})),food:[],circles:[],surface:{displacement:Array(860).fill(0),velocity:Array(860).fill(0)}});
 test('private rooms carry two players, input and exact host snapshots',async()=>{
  let time=100000;await fixture(async call=>{
-  assert.equal((await call('/v1/chomp/health')).body.protocol,2);
+  assert.equal((await call('/v1/chomp/health')).body.protocol,3);
   const host=(await call('/v1/chomp/rooms',join)).body;
   const guest=(await call('/v1/chomp/join',{...join,name:'Coral',code:host.code})).body;
   assert.equal(guest.slot,1);assert.notEqual(host.token,guest.token);
@@ -82,5 +82,18 @@ test('protocol 2 dense ocean and hazards relay without breaking old rooms',async
   assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,400);
   const old=(await call('/v1/chomp/rooms',join)).body;
   assert.equal((await call('/v1/chomp/exchange',{code:old.code,input,snapshot:world()},old.token)).status,200);
+ },{now:()=>time});
+});
+
+test('protocol 3 preserves modes, teams, respawns, crowns and brown food in rooms',async()=>{
+ let time=400000;await fixture(async call=>{
+  const h=(await call('/v1/chomp/rooms',{...join,protocol:3,mode:'team'})).body;
+  assert.equal(h.mode,'team');const g=(await call('/v1/chomp/join',{...join,protocol:3,mode:'king',code:h.code})).body;assert.equal(g.mode,'team');
+  const snapshot={...world(),protocol:3,fish:Array.from({length:65},(_,id)=>({...world().fish[0],id})),food:[[1,5000,20000,1,7],[2,6000,20000,1,8]],mines:[],mode:'team',crownTimes:Array(65).fill(0),roundResult:null};
+  assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,200);
+  const received=await call('/v1/chomp/exchange',{code:h.code,input},g.token);assert.equal(received.body.snapshot.mode,'team');assert.equal(received.body.snapshot.food[0][4],7);
+  time+=200;snapshot.mode='king';assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,400);
+  snapshot.mode='team';time+=200;snapshot.crownTimes[0]=999;assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,400);
+  assert.equal((await call('/v1/chomp/join',{...join,protocol:2,code:h.code})).status,409);
  },{now:()=>time});
 });
