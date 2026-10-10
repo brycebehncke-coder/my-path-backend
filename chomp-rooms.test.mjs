@@ -18,7 +18,7 @@ const join={name:'Nemo',skin:31,protocol:1},input={x:1,y:0,boost:0,chomp:0};
 const world=()=>({protocol:1,elapsed:0,fish:Array.from({length:29},(_,id)=>({id,name:'Fish',position:{x:10,y:20},mass:64,capacity:64})),food:[],circles:[],surface:{displacement:Array(860).fill(0),velocity:Array(860).fill(0)}});
 test('private rooms carry two players, input and exact host snapshots',async()=>{
  let time=100000;await fixture(async call=>{
-  assert.equal((await call('/v1/chomp/health')).body.protocol,3);
+  assert.equal((await call('/v1/chomp/health')).body.protocol,4);
   const host=(await call('/v1/chomp/rooms',join)).body;
   const guest=(await call('/v1/chomp/join',{...join,name:'Coral',code:host.code})).body;
   assert.equal(guest.slot,1);assert.notEqual(host.token,guest.token);
@@ -95,5 +95,63 @@ test('protocol 3 preserves modes, teams, respawns, crowns and brown food in room
   time+=200;snapshot.mode='king';assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,400);
   snapshot.mode='team';time+=200;snapshot.crownTimes[0]=999;assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot},h.token)).status,400);
   assert.equal((await call('/v1/chomp/join',{...join,protocol:2,code:h.code})).status,409);
+ },{now:()=>time});
+});
+
+const queueJoin=(mode='king',i=1)=>({name:'Queued '+i,skin:i,protocol:4,mode,requestID:`00000000-0000-4000-8000-${String(i).padStart(12,'0')}`});
+const newWorld=(mode='king')=>({...world(),protocol:4,mode,fish:Array.from({length:mode==='ocean'?65:24},(_,id)=>({...world().fish[0],id})),food:[],mines:[],crownTimes:Array(mode==='ocean'?65:24).fill(0),roundResult:null,surface:{displacement:Array(mode==='ocean'?860:609).fill(0),velocity:Array(mode==='ocean'?860:609).fill(0)}});
+test('real queued counts and one shared deadline admit two people into the same mode and room',async()=>{
+ let time=119000;await fixture(async call=>{
+  const before=(await call('/v1/chomp/lobbies')).body;assert.equal(before.modes.length,4);assert.ok(before.modes.every(m=>m.queued===0&&m.startsAt===120000));
+  const a=(await call('/v1/chomp/queue',queueJoin())).body,b=(await call('/v1/chomp/queue',queueJoin('king',2))).body;
+  assert.equal((await call('/v1/chomp/queue',queueJoin())).body.queueToken,a.queueToken,'idempotent join');
+  assert.equal(b.modes.find(m=>m.mode==='king').queued,2);assert.equal(b.ticket,null);
+  const state=(await call('/v1/chomp/lobbies')).body;assert.equal(JSON.stringify(state).includes(a.queueToken),false);
+  time=120001;
+  const ha=(await call('/v1/chomp/queue/status',{},a.queueToken)).body,hb=(await call('/v1/chomp/queue/status',{},b.queueToken)).body;
+  assert.equal(ha.ticket.code,hb.ticket.code);assert.equal(ha.ticket.slot,0);assert.equal(hb.ticket.slot,1);assert.equal(ha.ticket.mode,'king');
+  assert.equal(ha.modes.find(m=>m.mode==='king').queued,0);assert.equal(ha.modes[0].startsAt,150000);
+  assert.equal((await call('/v1/chomp/exchange',{code:ha.ticket.code,input,snapshot:newWorld()},ha.ticket.token)).status,200);
+  assert.equal((await call('/v1/chomp/exchange',{code:hb.ticket.code,input},hb.ticket.token)).body.snapshot.fish.length,24);
+ },{now:()=>time});
+});
+test('cancel, stale participants, invalid credentials and separate modes never inflate counts',async()=>{
+ let time=100000;await fixture(async call=>{
+  const a=(await call('/v1/chomp/queue',queueJoin())).body;
+  assert.equal((await call('/v1/chomp/queue/status',{},'wrong')).status,410);
+  const b=(await call('/v1/chomp/queue',queueJoin('team',2))).body;
+  await call('/v1/chomp/queue/leave',{},a.queueToken);
+  assert.equal((await call('/v1/chomp/lobbies')).body.modes.find(m=>m.mode==='king').queued,0);
+  time+=12001;assert.equal((await call('/v1/chomp/queue/status',{},b.queueToken)).status,410);
+  assert.ok((await call('/v1/chomp/lobbies')).body.modes.every(m=>m.queued===0));
+  assert.equal((await call('/v1/chomp/queue',{...queueJoin(),protocol:3})).status,400);
+  assert.equal((await call('/v1/chomp/queue',{...queueJoin(),mode:'wrong'})).status,400);
+ },{now:()=>time});
+});
+test('queue capacities and busy server defer actual starts without inventing rooms',async()=>{
+ let time=119000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/rooms',{...join,protocol:4})).body;
+  const queued=[];for(let i=0;i<4;i++)queued.push((await call('/v1/chomp/queue',queueJoin('deathmatch',i+1))).body);
+  assert.equal((await call('/v1/chomp/queue',queueJoin('deathmatch',9))).status,409);
+  time=120001;const waiting=(await call('/v1/chomp/queue/status',{},queued[0].queueToken)).body;
+  assert.equal(waiting.ticket,null);assert.equal(waiting.modes.find(m=>m.mode==='deathmatch').startsAt,150000);assert.equal(waiting.modes.find(m=>m.mode==='deathmatch').capacityWait,true);
+  await call('/v1/chomp/leave',{code:host.code},host.token);
+  // Keep only the first queue participant present until the next real start.
+  for(time=125000;time<150000;time+=5000)await call('/v1/chomp/queue/status',{},queued[0].queueToken);
+  const admitted=(await call('/v1/chomp/queue/status',{},queued[0].queueToken)).body;assert.equal(admitted.ticket.slot,0);
+  assert.equal((await call('/v1/chomp/queue/leave',{},queued[0].queueToken)).status,200);
+  assert.equal((await call('/v1/chomp/exchange',{code:admitted.ticket.code,input},admitted.ticket.token)).status,410);
+ },{now:()=>time,maxRooms:1});
+});
+test('protocol four uses the selected map population and wave width while old clients remain separate',async()=>{
+ let time=200000;await fixture(async call=>{
+  for(const mode of ['ocean','king','deathmatch','team']) {
+   const h=(await call('/v1/chomp/rooms',{...join,protocol:4,mode})).body;
+   assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:newWorld(mode)},h.token)).status,200);
+   time+=100;const bad=newWorld(mode);bad.surface.displacement.pop();assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:bad},h.token)).status,400);
+   time+=100;const badCount=newWorld(mode);badCount.fish.pop();assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:badCount},h.token)).status,400);
+   assert.equal((await call('/v1/chomp/join',{...join,protocol:3,code:h.code})).status,409);
+   await call('/v1/chomp/leave',{code:h.code},h.token);
+  }
  },{now:()=>time});
 });

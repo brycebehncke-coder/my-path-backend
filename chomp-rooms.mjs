@@ -3,22 +3,25 @@ import { randomBytes } from 'node:crypto';
 // Private, short-lived playtest relay. The host phone owns the simulation.
 // No accounts, wallet, database, billing, or other game state is accessed.
 export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
-  const rooms = new Map(), attempts = new Map();
+  const rooms = new Map(), attempts = new Map(), queue = new Map();
+  const modes=["ocean","king","deathmatch","team"], interval=30000;
+  const nextStart=()=>Math.floor(now()/interval)*interval+interval;
   const reply = (res, status, data) => {
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(data));
   };
-  const cleanName = value => String(value ?? 'Player').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 16) || 'Player';
+  const cleanName = value => Array.from(String(value ?? 'Player').replace(/[\x00-\x1f\x7f]/g, '').trim()).slice(0, 16).join('') || 'Player';
   const expire = () => {
     for (const [code, room] of rooms) {
       if (now() - room.hostSeen > 12000 || now() - room.created > 3600000) { rooms.delete(code); continue; }
       for (const [token, player] of room.players) if (player.slot !== 0 && now() - player.seen > 12000) room.players.delete(token);
     }
+    for (const [token, entry] of queue) if(now()-entry.seen>12000)queue.delete(token);
     for (const [ip, entry] of attempts) if (now() - entry.start > 60000) attempts.delete(ip);
   };
   function validateSnapshot(s, protocol) {
-    if (!s || s.protocol !== protocol || !Number.isFinite(s.elapsed) || !Array.isArray(s.fish) || s.fish.length !== (protocol>=2?65:29) || !Array.isArray(s.food) || s.food.length > (protocol===3?2400:protocol===2?6000:1800) || !Array.isArray(s.circles) || s.circles.length > 12) return false;
-    if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== 860 || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== 860) return false;
+    if (!s || s.protocol !== protocol || !Number.isFinite(s.elapsed) || !Array.isArray(s.fish) || s.fish.length !== (protocol===4&&s.mode!=='ocean'?24:protocol>=2?65:29) || !Array.isArray(s.food) || s.food.length > (protocol>=3?2400:protocol===2?6000:1800) || !Array.isArray(s.circles) || s.circles.length > 12) return false;
+    if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== (protocol===4&&s.mode!=='ocean'?609:860) || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== s.surface.displacement.length) return false;
     const finite = n => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 1e12;
     for (let i=0;i<s.fish.length;i++) {
       const f=s.fish[i];
@@ -26,11 +29,38 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     }
     if(protocol>=2) {
       if(!Array.isArray(s.mines) || s.mines.length>40 || !s.mines.every(m=>Number.isSafeInteger(m.id)&&m.position&&finite(m.position.x)&&finite(m.position.y)))return false;
-      if(!s.food.every(f=>Array.isArray(f)&&f.length===5&&f.every(Number.isSafeInteger)&&f[3]>0&&f[3]<=100000000&&f[4]>=0&&f[4]<=(protocol===3?8:6)))return false;
+      if(!s.food.every(f=>Array.isArray(f)&&f.length===5&&f.every(Number.isSafeInteger)&&f[3]>0&&f[3]<=100000000&&f[4]>=0&&f[4]<=(protocol>=3?8:6)))return false;
     }
-    if(protocol===3 && (!['ocean','king','deathmatch','team'].includes(s.mode)||!Array.isArray(s.crownTimes)||s.crownTimes.length!==65||!s.crownTimes.every(n=>finite(n)&&n>=0&&n<=181)||s.roundResult!=null&&(typeof s.roundResult!=='string'||s.roundResult.length>64)))return false;
+    if(protocol>=3 && (!['ocean','king','deathmatch','team'].includes(s.mode)||!Array.isArray(s.crownTimes)||s.crownTimes.length!==s.fish.length||!s.crownTimes.every(n=>finite(n)&&n>=0&&n<=181)||s.roundResult!=null&&(typeof s.roundResult!=='string'||s.roundResult.length>64)))return false;
     return true;
   }
+  function newRoom(protocol,mode) {
+    let code;do {code=randomBytes(5).toString('hex').toUpperCase();}while(rooms.has(code));
+    const room={protocol,mode,created:now(),hostSeen:now(),players:new Map(),snapshot:null,revision:0};rooms.set(code,room);return {code,room};
+  }
+  function addPlayer(code,room,name,skin) {
+    const used=new Set([...room.players.values()].map(p=>p.slot));let slot=0;while(used.has(slot))slot++;
+    if(slot>=4)return null;
+    const token=randomBytes(32).toString('base64url');
+    room.players.set(token,{slot,identity:randomBytes(8).toString('hex'),name:cleanName(name),skin:Math.max(0,Math.min(31,Math.floor(Number(skin)||0))),seen:now(),lastExchange:0,input:{x:0,y:0,boost:0,chomp:0}});
+    return {code,token,slot,protocol:room.protocol,mode:room.mode};
+  }
+  function settleQueue() {
+    for(const mode of modes) {
+      const waiting=[...queue.values()].filter(e=>e.mode===mode&&!e.ticket);
+      if(!waiting.length||waiting[0].startsAt>now())continue;
+      if(rooms.size>=maxRooms) {for(const e of waiting){e.startsAt=nextStart();e.capacityWait=true;}continue;}
+      const {code,room}=newRoom(4,mode);
+      for(const e of waiting){e.ticket=addPlayer(code,room,e.name,e.skin);e.seen=now();}
+    }
+  }
+  function lobbyState() {
+    return {serverTime:now(),intervalSeconds:interval/1000,modes:modes.map(mode=>{
+      const waiting=[...queue.values()].filter(e=>e.mode===mode&&!e.ticket);
+      return {mode,startsAt:waiting[0]?.startsAt??nextStart(),queued:waiting.length,capacity:4,capacityWait:waiting.some(e=>e.capacityWait)};
+    })};
+  }
+  function queueState(token,e) {return {...lobbyState(),queueToken:token,mode:e.mode,ticket:e.ticket??null};}
   async function body(req) {
     const chunks=[];let size=0;
     for await (const chunk of req) { size+=chunk.length;if(size>786432) throw new Error('Request too large');chunks.push(chunk); }
@@ -39,23 +69,70 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
   return async function chompRooms(req,res) {
     const path=new URL(req.url || '/', 'http://localhost').pathname;
     if (!path.startsWith('/v1/chomp/')) return false;
-    expire();
-    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:3,compatibleProtocols:[1,2,3],mode:'private-hosted-playtest',maxPlayers:4});return true;}
+    expire();settleQueue();
+    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4],mode:'private-hosted-playtest',maxPlayers:4});return true;}
+    if(path==='/v1/chomp/lobbies'&&req.method==='GET'){reply(res,200,lobbyState());return true;}
     if (req.method!=='POST') {reply(res,405,{error:'Use POST.'});return true;}
     try {
       const b=await body(req);
       if (!b || Array.isArray(b) || typeof b!=='object') throw new Error('Invalid request');
-      if (path==='/v1/chomp/rooms' || path==='/v1/chomp/join') {
+      if(path==='/v1/chomp/queue' || path.startsWith('/v1/chomp/queue/')) {
+        const token=/^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization||'')?.[1];
+        if(path==='/v1/chomp/queue') {
+          if(b.protocol!==4||!modes.includes(b.mode)||!/^[-a-f0-9]{36}$/i.test(b.requestID||'')){reply(res,400,{error:'Update the game and try again.'});return true;}
+          const existing=[...queue].find(([,e])=>e.requestID===b.requestID);
+          if(existing){existing[1].seen=now();reply(res,200,queueState(...existing));return true;}
+          const ip=req.socket.remoteAddress||'unknown',entry=attempts.get(ip)||{start:now(),count:0};
+          if(entry.count++>=60||(!attempts.has(ip)&&attempts.size>=1024)){reply(res,429,{error:'Please wait before joining again.'});return true;}attempts.set(ip,entry);
+          const waiting=[...queue.values()].filter(e=>e.mode===b.mode&&!e.ticket);
+          if(waiting.length>=4||queue.size>=64){reply(res,409,{error:'This next game is full. Try another mode or wait for the next start.'});return true;}
+          const key=randomBytes(32).toString('base64url'),e={requestID:b.requestID,mode:b.mode,name:cleanName(b.name),skin:b.skin,seen:now(),startsAt:waiting[0]?.startsAt??nextStart(),capacityWait:false};
+          queue.set(key,e);reply(res,200,queueState(key,e));return true;
+        }
+        const e=queue.get(token);
+        if(path==='/v1/chomp/queue/leave') {
+          if(e?.ticket){const room=rooms.get(e.ticket.code);if(e.ticket.slot===0)rooms.delete(e.ticket.code);else room?.players.delete(e.ticket.token);}
+          queue.delete(token);reply(res,200,{ok:true});return true;
+        }
+        if(path!=='/v1/chomp/queue/status'){reply(res,404,{error:'Unknown queue action.'});return true;}
+        if(!e){reply(res,410,{error:'You left the queue. Join the next game when ready.'});return true;}
+        if(e.ticket&&!rooms.has(e.ticket.code)){queue.delete(token);reply(res,410,{error:'The host left before the game started. Join the next game.'});return true;}
+        e.seen=now();reply(res,200,queueState(token,e));return true;
+      }
+      if (path==='/v1/chomp/rooms'  || path==='/v1/chomp/join') {
         const ip=req.socket.remoteAddress || 'unknown';
         const entry=attempts.get(ip) || {start:now(),count:0};
         if (entry.count++>=60 || (!attempts.has(ip) && attempts.size>=1024)) {reply(res,429,{error:'Please wait before trying another room.'});return true;}
         attempts.set(ip,entry);
-        if (![1,2,3].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
+        if (![1,2,3,4].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
         let room,code;
-        if (path==='/v1/chomp/rooms') {
+        if(path==='/v1/chomp/queue' || path.startsWith('/v1/chomp/queue/')) {
+        const token=/^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization||'')?.[1];
+        if(path==='/v1/chomp/queue') {
+          if(b.protocol!==4||!modes.includes(b.mode)||!/^[-a-f0-9]{36}$/i.test(b.requestID||'')){reply(res,400,{error:'Update the game and try again.'});return true;}
+          const existing=[...queue].find(([,e])=>e.requestID===b.requestID);
+          if(existing){existing[1].seen=now();reply(res,200,queueState(...existing));return true;}
+          const ip=req.socket.remoteAddress||'unknown',entry=attempts.get(ip)||{start:now(),count:0};
+          if(entry.count++>=60||(!attempts.has(ip)&&attempts.size>=1024)){reply(res,429,{error:'Please wait before joining again.'});return true;}attempts.set(ip,entry);
+          const waiting=[...queue.values()].filter(e=>e.mode===b.mode&&!e.ticket);
+          if(waiting.length>=4||queue.size>=64){reply(res,409,{error:'This next game is full. Try another mode or wait for the next start.'});return true;}
+          const key=randomBytes(32).toString('base64url'),e={requestID:b.requestID,mode:b.mode,name:cleanName(b.name),skin:b.skin,seen:now(),startsAt:waiting[0]?.startsAt??nextStart(),capacityWait:false};
+          queue.set(key,e);reply(res,200,queueState(key,e));return true;
+        }
+        const e=queue.get(token);
+        if(path==='/v1/chomp/queue/leave') {
+          if(e?.ticket){const room=rooms.get(e.ticket.code);if(e.ticket.slot===0)rooms.delete(e.ticket.code);else room?.players.delete(e.ticket.token);}
+          queue.delete(token);reply(res,200,{ok:true});return true;
+        }
+        if(path!=='/v1/chomp/queue/status'){reply(res,404,{error:'Unknown queue action.'});return true;}
+        if(!e){reply(res,410,{error:'You left the queue. Join the next game when ready.'});return true;}
+        if(e.ticket&&!rooms.has(e.ticket.code)){queue.delete(token);reply(res,410,{error:'The host left before the game started. Join the next game.'});return true;}
+        e.seen=now();reply(res,200,queueState(token,e));return true;
+      }
+      if (path==='/v1/chomp/rooms' ) {
           if (rooms.size>=maxRooms) {reply(res,503,{error:'Test rooms are full. Try again shortly.'});return true;}
           do {code=randomBytes(5).toString('hex').toUpperCase();} while(rooms.has(code));
-          room={protocol:b.protocol,mode:b.protocol===3&&["ocean","king","deathmatch","team"].includes(b.mode)?b.mode:"ocean",created:now(),hostSeen:now(),players:new Map(),snapshot:null,revision:0};rooms.set(code,room);
+          room={protocol:b.protocol,mode:b.protocol>=3&&["ocean","king","deathmatch","team"].includes(b.mode)?b.mode:"ocean",created:now(),hostSeen:now(),players:new Map(),snapshot:null,revision:0};rooms.set(code,room);
         } else {code=String(b.code||'').toUpperCase();room=rooms.get(code);}
         if (!room) {reply(res,404,{error:'That room has closed. Ask the host for a new code.'});return true;}
         if(room.protocol!==b.protocol) {reply(res,409,{error:"Update chomp chomp.io on both phones before joining this room."});return true;}
@@ -79,7 +156,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
       player.input={x:input.x,y:input.y,boost:Math.max(player.input.boost,input.boost),chomp:Math.max(player.input.chomp,input.chomp)};
       if(player.slot===0) {
         room.hostSeen=now();
-        if(b.snapshot) {if(!validateSnapshot(b.snapshot,room.protocol)||(room.protocol===3&&b.snapshot.mode!==room.mode))throw new Error('Invalid world snapshot');room.snapshot=b.snapshot;room.revision++;}
+        if(b.snapshot) {if(!validateSnapshot(b.snapshot,room.protocol)||(room.protocol>=3&&b.snapshot.mode!==room.mode))throw new Error('Invalid world snapshot');room.snapshot=b.snapshot;room.revision++;}
       } else if(b.snapshot) {reply(res,403,{error:'Only the host can send the world.'});return true;}
       const players=[...room.players.values()].map(p=>({slot:p.slot,identity:p.identity,name:p.name,skin:p.skin,input:now()-p.seen>1200?{...p.input,x:0,y:0}:p.input}));
       reply(res,200,{revision:room.revision,players,snapshot:player.slot===0?null:room.snapshot});return true;
