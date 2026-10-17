@@ -155,3 +155,146 @@ test('protocol four uses the selected map population and wave width while old cl
   }
  },{now:()=>time});
 });
+
+// Additive v5 fixtures. The protocol 1–4 fixtures above retain their original values.
+const immediateJoin=(mode='king',i=1)=>({...queueJoin(mode,i),protocol:5,ruleset:'chomp-quarter-v1',skin:39});
+const quarterWorld=(mode='king')=>({...newWorld(mode),protocol:5,ruleset:'chomp-quarter-v1',fish:newWorld(mode).fish.map(f=>({...f,skinID:39})),surface:{displacement:Array(mode==='ocean'?860:431).fill(0),velocity:Array(mode==='ocean'?860:431).fill(0)}});
+
+test('v5 capability and immediate public admission need no countdown or human minimum',async()=>{
+ let time=119000;await fixture(async call=>{
+  const capability=(await call('/v1/chomp/capabilities')).body;
+  assert.deepEqual(capability.protocols,[1,2,3,4,5]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,39);assert.equal(capability.immediatePublic,true);
+  const a=(await call('/v1/chomp/match',immediateJoin())).body;
+  assert.equal(a.intervalSeconds,0);assert.ok(a.ticket);assert.equal(a.ticket.slot,0);assert.equal(a.ticket.ruleset,'chomp-quarter-v1');
+  assert.equal(a.modes.find(m=>m.mode==='king').humans,1,'only a real person is counted; the host simulates the remaining fish as bots');
+  assert.ok(a.modes.every(m=>m.queued===0));
+  const repeat=(await call('/v1/chomp/match',immediateJoin())).body;
+  assert.deepEqual(repeat.ticket,a.ticket);assert.equal(repeat.queueToken,a.queueToken);
+  const guest=(await call('/v1/chomp/match',immediateJoin('king',2))).body;
+  assert.equal(guest.ticket.code,a.ticket.code);assert.equal(guest.ticket.slot,1);
+  assert.equal(guest.modes.find(m=>m.mode==='king').humans,2);
+  assert.equal((await call('/v1/chomp/exchange',{code:a.ticket.code,input,snapshot:quarterWorld()},a.ticket.token)).status,200);
+  const remote=await call('/v1/chomp/exchange',{code:guest.ticket.code,input},guest.ticket.token);
+  assert.equal(remote.body.snapshot.fish.length,24);assert.equal(remote.body.snapshot.surface.displacement.length,431);
+  assert.equal(remote.body.players.length,2);assert.equal(new Set(remote.body.players.map(p=>p.identity)).size,2);
+  const legacy=(await call('/v1/chomp/lobbies')).body;assert.equal(legacy.intervalSeconds,30);assert.ok(legacy.modes.every(m=>m.queued===0));
+ },{now:()=>time});
+});
+
+test('v5 public routing isolates private rooms and modes and enforces four-human and shared room caps',async()=>{
+ let time=200000;await fixture(async call=>{
+  const privateRoom=(await call('/v1/chomp/rooms',immediateJoin())).body;
+  const requests=[];for(let i=1;i<=4;i++)requests.push((await call('/v1/chomp/match',immediateJoin('king',i))).body);
+  assert.notEqual(requests[0].ticket.code,privateRoom.code);assert.deepEqual(requests.map(r=>r.ticket.slot),[0,1,2,3]);
+  assert.ok(requests.every(r=>r.ticket.code===requests[0].ticket.code));
+  assert.equal((await call('/v1/chomp/match',immediateJoin('king',5))).status,503);
+  assert.equal((await call('/v1/chomp/match',immediateJoin('team',6))).status,503);
+  assert.equal((await call('/v1/chomp/matches')).body.modes.find(m=>m.mode==='king').capacityWait,true);
+  await call('/v1/chomp/match/leave',{},requests[2].queueToken);
+  const replacement=(await call('/v1/chomp/match',immediateJoin('king',7))).body;
+  assert.equal(replacement.ticket.code,requests[0].ticket.code);assert.equal(replacement.ticket.slot,2);
+  await call('/v1/chomp/leave',{code:privateRoom.code},privateRoom.token);
+  const team=(await call('/v1/chomp/match',immediateJoin('team',8))).body;
+  assert.notEqual(team.ticket.code,replacement.ticket.code);assert.equal(team.ticket.mode,'team');
+ },{now:()=>time,maxRooms:2});
+});
+
+test('v5 canceled, lost-response and changed requests cannot admit duplicate players',async()=>{
+ let time=100000;await fixture(async call=>{
+  const request=immediateJoin(),a=(await call('/v1/chomp/match',request)).body;
+  assert.equal((await call('/v1/chomp/match',{...request,mode:'team'})).status,409);
+  assert.equal((await call('/v1/chomp/match',{...request,skin:38})).status,409);
+  assert.equal((await call('/v1/chomp/match/status',{},'wrong')).status,410);
+  // Caller knows its UUID even when the admission reply is lost.
+  assert.equal((await call('/v1/chomp/match/cancel',{requestID:request.requestID})).status,200);
+  assert.equal((await call('/v1/chomp/match/cancel',{requestID:request.requestID})).status,200);
+  assert.equal((await call('/v1/chomp/match',request)).status,410);
+  assert.equal((await call('/v1/chomp/exchange',{code:a.ticket.code,input},a.ticket.token)).status,410);
+  const raced=immediateJoin('king',2);
+  await call('/v1/chomp/match/cancel',{requestID:raced.requestID});
+  assert.equal((await call('/v1/chomp/match',raced)).status,410,'cancel-before-admit leaves a bounded tombstone');
+  const next=(await call('/v1/chomp/match',immediateJoin('king',3))).body;
+  await call('/v1/chomp/match/leave',{},next.queueToken);await call('/v1/chomp/match/leave',{},next.queueToken);
+  assert.equal((await call('/v1/chomp/match/status',{},next.queueToken)).status,410);
+ },{now:()=>time,maxRooms:1});
+});
+
+test('v5 room expiry and slot replacement expose a new occupant identity to guests',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/match',immediateJoin())).body;
+  const guest=(await call('/v1/chomp/match',immediateJoin('king',2))).body;
+  const first=await call('/v1/chomp/exchange',{code:host.ticket.code,input,snapshot:quarterWorld()},host.ticket.token);
+  const oldIdentity=first.body.players.find(p=>p.slot===1).identity;
+  time+=7000;await call('/v1/chomp/exchange',{code:host.ticket.code,input},host.ticket.token);
+  time+=6000;
+  const advancing=quarterWorld();advancing.elapsed=13;await call('/v1/chomp/exchange',{code:host.ticket.code,input,snapshot:advancing},host.ticket.token);
+  const next=(await call('/v1/chomp/match',immediateJoin('king',3))).body;
+  assert.equal(next.ticket.slot,1);assert.equal(next.ticket.code,host.ticket.code);
+  const roster=await call('/v1/chomp/exchange',{code:host.ticket.code,input},next.ticket.token);
+  assert.notEqual(roster.body.players.find(p=>p.slot===1).identity,oldIdentity);
+  assert.equal((await call('/v1/chomp/match/status',{},guest.queueToken)).status,410);
+  time+=12001;
+  assert.equal((await call('/v1/chomp/match/status',{},host.queueToken)).status,410);
+  assert.equal((await call('/v1/chomp/match',immediateJoin())).status,410,'expired admission does not silently reopen');
+ },{now:()=>time});
+});
+
+test('competitive admission closes at 30 seconds or a result while Ocean remains joinable',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/match',immediateJoin())).body;
+  const ended=quarterWorld();ended.roundResult='Coral wins';
+  await call('/v1/chomp/exchange',{code:host.ticket.code,input,snapshot:ended},host.ticket.token);
+  assert.equal((await call('/v1/chomp/match',immediateJoin('king',2))).status,503);
+  await call('/v1/chomp/match/leave',{},host.queueToken);
+  const round=(await call('/v1/chomp/match',immediateJoin('team',3))).body;
+  const snapshot=quarterWorld('team');snapshot.elapsed=30;
+  await call('/v1/chomp/exchange',{code:round.ticket.code,input,snapshot},round.ticket.token);
+  assert.equal((await call('/v1/chomp/match',immediateJoin('team',4))).status,503);
+  await call('/v1/chomp/match/leave',{},round.queueToken);
+  const wall=(await call('/v1/chomp/match',immediateJoin('deathmatch',5))).body;
+  for(let i=0;i<3;i++){time+=10000;const slow=quarterWorld('deathmatch');slow.elapsed=i+1;await call('/v1/chomp/exchange',{code:wall.ticket.code,input,snapshot:slow},wall.ticket.token);}
+  assert.equal((await call('/v1/chomp/match',immediateJoin('deathmatch',6))).status,503,'wall time also closes a slowly advancing host round');
+  await call('/v1/chomp/match/leave',{},wall.queueToken);
+  const ocean=(await call('/v1/chomp/match',immediateJoin('ocean',7))).body;
+  const ongoing=quarterWorld('ocean');ongoing.elapsed=60;
+  await call('/v1/chomp/exchange',{code:ocean.ticket.code,input,snapshot:ongoing},ocean.ticket.token);
+  const joined=(await call('/v1/chomp/match',immediateJoin('ocean',8))).body;
+  assert.equal(joined.ticket.code,ocean.ticket.code);assert.equal(joined.ticket.slot,1);
+ },{now:()=>time,maxRooms:1});
+});
+
+test('v5 validates exact ruleset, mode, wave geometry, skin catalog and finite wave state',async()=>{
+ let time=100000;await fixture(async call=>{
+  assert.equal((await call('/v1/chomp/match',{...immediateJoin(),ruleset:'unknown'})).status,409);
+  assert.equal((await call('/v1/chomp/rooms',{...immediateJoin(),skin:40})).status,409);
+  assert.equal((await call('/v1/chomp/rooms',{...immediateJoin(),skin:-1})).status,409);
+  assert.equal((await call('/v1/chomp/rooms',{...immediateJoin(),skin:1.5})).status,409);
+  for(const mode of ['ocean','king','deathmatch','team']) {
+   const host=(await call('/v1/chomp/rooms',immediateJoin(mode))).body;
+   assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:quarterWorld(mode)},host.token)).status,200);
+   assert.equal((await call('/v1/chomp/join',{...join,protocol:4,code:host.code})).status,409);
+   for(const mutate of [s=>{s.ruleset='other'},s=>{s.protocol=4},s=>{s.mode=mode==='ocean'?'king':'ocean'},s=>{s.surface.displacement=Array(609).fill(0);s.surface.velocity=Array(609).fill(0)},s=>{s.surface.velocity[0]=null},s=>{s.fish[0].skinID=40}]) {
+    time+=100;const snapshot=quarterWorld(mode);mutate(snapshot);
+    assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot},host.token)).status,400);
+   }
+   await call('/v1/chomp/leave',{code:host.code},host.token);
+  }
+  const old=(await call('/v1/chomp/rooms',{...join,protocol:4,mode:'king'})).body;
+  assert.equal((await call('/v1/chomp/join',{...immediateJoin(),code:old.code})).status,409);
+  assert.equal((await call('/v1/chomp/exchange',{code:old.code,input,snapshot:newWorld()},old.token)).status,200,'unchanged 609-wave legacy room remains valid');
+ },{now:()=>time});
+});
+
+
+test('public admission does not place newcomers into a frozen host world',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/match',immediateJoin('ocean'))).body;
+  await call('/v1/chomp/exchange',{code:host.ticket.code,input,snapshot:quarterWorld('ocean')},host.ticket.token);
+  time+=3001;
+  await call('/v1/chomp/exchange',{code:host.ticket.code,input},host.ticket.token);
+  assert.equal((await call('/v1/chomp/match',immediateJoin('ocean',2))).status,503,'presence alone does not make a stopped world playable');
+  time+=100;const resumed=quarterWorld('ocean');resumed.elapsed=1;
+  await call('/v1/chomp/exchange',{code:host.ticket.code,input,snapshot:resumed},host.ticket.token);
+  assert.equal((await call('/v1/chomp/match',immediateJoin('ocean',3))).body.ticket.code,host.ticket.code);
+ },{now:()=>time,maxRooms:1});
+});
