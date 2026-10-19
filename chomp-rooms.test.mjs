@@ -163,7 +163,7 @@ const quarterWorld=(mode='king')=>({...newWorld(mode),protocol:5,ruleset:'chomp-
 test('v5 capability and immediate public admission need no countdown or human minimum',async()=>{
  let time=119000;await fixture(async call=>{
   const capability=(await call('/v1/chomp/capabilities')).body;
-  assert.deepEqual(capability.protocols,[1,2,3,4,5,6,7,8]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,42);assert.equal(capability.immediatePublic,true);
+  assert.deepEqual(capability.protocols,[1,2,3,4,5,6,7,8,9]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,42);assert.equal(capability.immediatePublic,true);
   const a=(await call('/v1/chomp/match',immediateJoin())).body;
   assert.equal(a.intervalSeconds,0);assert.ok(a.ticket);assert.equal(a.ticket.slot,0);assert.equal(a.ticket.ruleset,'chomp-quarter-v1');
   assert.equal(a.modes.find(m=>m.mode==='king').humans,1,'only a real person is counted; the host simulates the remaining fish as bots');
@@ -692,4 +692,102 @@ test('v8 crab releases retain angle/life, reject malformed events and isolate le
    assert.equal(received.fish[0].clawAngle,Math.PI);assert.equal(received.fish[1].skinID,42);
   },{now:()=>time});
  }
+});
+
+const eliminationJoin=(mode='team',i=1)=>({...teamJoin(mode,i),protocol:9,ruleset:'chomp-elimination-v5'});
+const eliminationWorld=(roster,mode='team')=>{
+ const s={...tacticalWorld(roster,mode),protocol:9,ruleset:'chomp-elimination-v5'};
+ s.fish=s.fish.map(f=>({...f,headPresent:true,respawnTime:0}));return s;
+};
+const eliminate=(s,killer,victim)=>{recordKill(s,killer,victim);Object.assign(s.fish[victim],{mass:0,headPresent:false,respawnTime:3.5});};
+test('v9 rejects competitive crabs at public/private admission and actual room join, preserving v8',async()=>{
+ for(const mode of ['king','deathmatch','team'])await fixture(async call=>{
+  const cfg=eliminationJoin(mode);
+  for(const skin of [40,41,42]) {
+   assert.equal((await call('/v1/chomp/rooms',{...cfg,skin})).status,409);
+   assert.equal((await call('/v1/chomp/match',{...cfg,skin})).status,409);
+  }
+  const host=(await call('/v1/chomp/rooms',{...cfg,skin:39})).body;
+  assert.equal((await call('/v1/chomp/join',{...cfg,mode:'ocean',skin:40,code:host.code})).status,409,'claimed Ocean mode cannot bypass real room');
+  const ocean=(await call('/v1/chomp/rooms',{...eliminationJoin('ocean'),skin:42})).body;
+  assert.equal(ocean.protocol,9);
+  const old=(await call('/v1/chomp/rooms',{...cfg,protocol:8,ruleset:'chomp-claws-v4',skin:42})).body;
+  assert.equal(old.protocol,8,'old competitive crab rooms remain compatible');
+ });
+});
+test('v9 elimination ends immediately and retained final survives host departure',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/rooms',eliminationJoin())).body;
+  const guest=(await call('/v1/chomp/join',{...eliminationJoin(),code:host.code,name:'Guest'})).body;
+  const roster=(await call('/v1/chomp/exchange',{code:host.code,input},host.token)).body.players;
+  const s=eliminationWorld(roster);s.elapsed=1;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token)).status,200);
+  for(let id=1;id<24;id+=2)eliminate(s,0,id);
+  s.elapsed=2;s.roundResult='RED TEAM WINS';time+=130;
+  const final=await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token);
+  assert.equal(final.status,200);assert.equal(final.body.roundResult,'BLUE TEAM WINS','relay derives result from living slots');
+  assert.equal(final.body.snapshot.fish[0].kills,12,'no 25-kill prerequisite');
+  await call('/v1/chomp/leave',{code:host.code},host.token);time+=13000;
+  const retained=await call('/v1/chomp/exchange',{code:host.code,input},guest.token);
+  assert.equal(retained.status,200);assert.equal(retained.body.roundResult,'BLUE TEAM WINS');
+ },{now:()=>time});
+});
+test('v9 rejects resurrection and multiple deaths without corrupting accepted world',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/rooms',eliminationJoin())).body;
+  const roster=(await call('/v1/chomp/exchange',{code:host.code,input},host.token)).body.players;
+  const s=eliminationWorld(roster);eliminate(s,0,1);s.elapsed=1;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token)).status,200);
+  const revived=structuredClone(s);Object.assign(revived.fish[1],{mass:64,headPresent:true,respawnTime:0});revived.elapsed=2;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:revived},host.token)).status,400);
+  const twice=structuredClone(s);recordKill(twice,0,1);twice.elapsed=2;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:twice},host.token)).status,400);
+  const crab=structuredClone(s);crab.fish[2].skinID=40;crab.elapsed=2;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:crab},host.token)).status,400);
+  s.elapsed=2;time+=130;assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token)).status,200);
+ },{now:()=>time});
+});
+test('v9 timeout ranks survivors before kills; v8 retains kill-target rules',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/rooms',eliminationJoin())).body;
+  const roster=(await call('/v1/chomp/exchange',{code:host.code,input},host.token)).body.players;
+  const s=eliminationWorld(roster);eliminate(s,0,1);
+  for(let n=1;n<=18;n++){time=100000+n*10000;s.elapsed=n*10;const r=await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token);assert.equal(r.status,200);if(n===18)assert.equal(r.body.roundResult,'BLUE TEAM WINS');}
+ },{now:()=>time});
+});
+test('v9 admission skips an eliminated open seat without resetting the match',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/rooms',eliminationJoin())).body;
+  const roster=(await call('/v1/chomp/exchange',{code:host.code,input},host.token)).body.players;
+  const s=eliminationWorld(roster);eliminate(s,0,1);s.elapsed=1;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token)).status,200);
+  const guest=await call('/v1/chomp/join',{...eliminationJoin(),code:host.code,name:'Late'});
+  assert.equal(guest.status,200);assert.equal(guest.body.slot,2,'slot1 remains eliminated');
+  assert.equal(guest.body.matchClock.endsAt,280000,'admission does not restart the clock');
+ },{now:()=>time});
+});
+test('v9 simultaneous elimination is a draw and malformed life fields are rejected',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/rooms',eliminationJoin())).body;
+  const roster=(await call('/v1/chomp/exchange',{code:host.code,input},host.token)).body.players;
+  const s=eliminationWorld(roster);
+  for(const field of [{headPresent:1},{respawnTime:-1},{respawnTime:null},{deaths:2}]){
+   const bad=structuredClone(s);Object.assign(bad.fish[2],field);time+=130;
+   assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:bad},host.token)).status,400);
+  }
+  for(const f of s.fish){f.mass=0;f.headPresent=false;f.respawnTime=3.5;f.deaths=1;s.matchStats.find(r=>r.slot===f.id).deaths=1;}
+  s.elapsed=1;time+=130;const result=await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token);
+  assert.equal(result.status,200);assert.equal(result.body.roundResult,'DRAW');
+ },{now:()=>time});
+});
+test('v9 public matching avoids rooms with no living available admission seats',async()=>{
+ let time=100000;await fixture(async call=>{
+  const host=(await call('/v1/chomp/match',eliminationJoin('team',91))).body.ticket;
+  const roster=(await call('/v1/chomp/exchange',{code:host.code,input},host.token)).body.players;
+  const s=eliminationWorld(roster);eliminate(s,0,1);eliminate(s,1,2);eliminate(s,0,3);s.elapsed=1;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:host.code,input,snapshot:s},host.token)).status,200);
+  assert.equal((await call('/v1/chomp/join',{...eliminationJoin(),code:host.code})).status,409);
+  const next=(await call('/v1/chomp/match',eliminationJoin('team',92))).body.ticket;
+  assert.notEqual(next.code,host.code);assert.equal(next.slot,0);
+ },{now:()=>time});
 });
