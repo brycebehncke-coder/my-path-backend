@@ -2,7 +2,9 @@ import { randomBytes } from 'node:crypto';
 
 export const CHOMP_RULESET = Object.freeze({protocol:6,id:'chomp-team-v2',catalog:2,maximumSkin:39,competitiveJoinSeconds:30});
 const LEGACY_RULESET=Object.freeze({...CHOMP_RULESET,protocol:5,id:'chomp-quarter-v1'});
-const rulesFor=protocol=>protocol===6?CHOMP_RULESET:protocol===5?LEGACY_RULESET:null;
+export const SWIM_RULESET=Object.freeze({...CHOMP_RULESET,protocol:7,id:'chomp-swim-v3'});
+export const CLAW_RULESET=Object.freeze({...SWIM_RULESET,protocol:8,id:'chomp-claws-v4',catalog:3,maximumSkin:42});
+const rulesFor=protocol=>protocol===8?CLAW_RULESET:protocol===7?SWIM_RULESET:protocol===6?CHOMP_RULESET:protocol===5?LEGACY_RULESET:null;
 
 // Private and public, short-lived playtest relay. The host phone owns the simulation.
 // No accounts, wallet, database, billing, or other game state is accessed.
@@ -18,7 +20,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
   const cleanName = value => Array.from(String(value ?? 'Player').replace(/[\x00-\x1f\x7f]/g, '').trim()).slice(0, 16).join('') || 'Player';
   const expire = () => {
     for (const [code, room] of rooms) {
-      if(room.protocol===6&&room.finalizedAt!=null) {
+      if(room.protocol>=6&&room.finalizedAt!=null) {
         if(now()-room.finalizedAt>60000||room.players.size===0)rooms.delete(code);
         continue;
       }
@@ -32,7 +34,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
   function validateSnapshot(s, protocol, ruleset) {
     if(protocol>=5 && (ruleset!==rulesFor(protocol)?.id || s?.ruleset!==ruleset))return false;
     if (!s || s.protocol !== protocol || !Number.isFinite(s.elapsed) || !Array.isArray(s.fish) || s.fish.length !== (protocol>=4&&s.mode!=='ocean'?24:protocol>=2?65:29) || !Array.isArray(s.food) || s.food.length > (protocol>=3?2400:protocol===2?6000:1800) || !Array.isArray(s.circles) || s.circles.length > 12) return false;
-    if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== (protocol>=4&&s.mode!=='ocean'?(protocol>=5?(protocol===6&&s.mode==='team'?305:431):609):860) || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== s.surface.displacement.length) return false;
+    if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== (protocol>=4&&s.mode!=='ocean'?(protocol>=5?(protocol>=6&&s.mode==='team'?305:431):609):860) || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== s.surface.displacement.length) return false;
     const finite = n => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 1e12;
     for (let i=0;i<s.fish.length;i++) {
       const f=s.fish[i];
@@ -45,10 +47,11 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     if(protocol>=3 && (!['ocean','king','deathmatch','team'].includes(s.mode)||!Array.isArray(s.crownTimes)||s.crownTimes.length!==s.fish.length||!s.crownTimes.every(n=>finite(n)&&n>=0&&n<=181)||s.roundResult!=null&&(typeof s.roundResult!=='string'||s.roundResult.length>64)))return false;
     if(protocol>=5) {
       if(s.elapsed<0 || s.elapsed>3600 || !s.surface.displacement.every(finite) || !s.surface.velocity.every(finite))return false;
-      if(!s.fish.every(f=>Number.isSafeInteger(f.skinID)&&f.skinID>=0&&f.skinID<=CHOMP_RULESET.maximumSkin))return false;
+      if(!s.fish.every(f=>Number.isSafeInteger(f.skinID)&&f.skinID>=0&&f.skinID<=rulesFor(protocol).maximumSkin))return false;
     }
-    if(protocol===6 && (!s.fish.every(f=>Number.isSafeInteger(f.kills)&&f.kills>=0&&f.kills<=100000&&Number.isSafeInteger(f.deaths)&&f.deaths>=0&&f.deaths<=100000)||!validMatchStats(s.matchStats,s.fish.length,s.mode)))return false;
-    if(protocol===6&&!s.matchStats.filter(r=>r.connected).every(r=>s.fish[r.slot].kills===r.kills&&s.fish[r.slot].deaths===r.deaths&&s.fish[r.slot].name===r.name))return false;
+    if(protocol>=8 && !s.fish.every(f=>f.clawAngle==null || Number.isFinite(f.clawAngle)&&Math.abs(f.clawAngle)<=Math.PI))return false;
+    if(protocol>=6 && (!s.fish.every(f=>Number.isSafeInteger(f.kills)&&f.kills>=0&&f.kills<=100000&&Number.isSafeInteger(f.deaths)&&f.deaths>=0&&f.deaths<=100000)||!validMatchStats(s.matchStats,s.fish.length,s.mode)))return false;
+    if(protocol>=6&&!s.matchStats.filter(r=>r.connected).every(r=>s.fish[r.slot].kills===r.kills&&s.fish[r.slot].deaths===r.deaths&&s.fish[r.slot].name===r.name))return false;
     return true;
   }
   function validMatchStats(stats,count,mode) {
@@ -67,9 +70,9 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     const rows=new Map(next.map(r=>[r.participantID,r]));
     return previous.every(old=>{const value=rows.get(old.participantID);return value&&value.slot===old.slot&&value.team===old.team&&value.isBot===old.isBot&&value.name===old.name&&value.kills>=old.kills&&value.deaths>=old.deaths&&(!value.connected||old.connected);});
   }
-  function matchClock(room) {return room.protocol===6&&room.mode!=='ocean'?{serverTime:now(),startsAt:room.created,endsAt:room.created+180000}:null;}
+  function matchClock(room) {return room.protocol>=6&&room.mode!=='ocean'?{serverTime:now(),startsAt:room.created,endsAt:room.created+180000}:null;}
   function finalizeDeadline(room) {
-    const s=room.snapshot;if(room.protocol!==6||room.mode==='ocean'||!s||s.roundResult!=null)return;
+    const s=room.snapshot;if(room.protocol<6||room.mode==='ocean'||!s||s.roundResult!=null)return;
     const scores=[0,1].map(team=>s.matchStats.filter(r=>r.team===team).reduce((sum,r)=>sum+r.kills,0));
     if(now()<room.created+180000 && !(room.mode==='team'&&Math.max(...scores)>=25))return;
     if(room.mode==='team')s.roundResult=scores[0]===scores[1]?'DRAW':scores[0]>scores[1]?'BLUE TEAM WINS':'RED TEAM WINS';
@@ -88,31 +91,31 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
   }
   function addPlayer(code,room,name,skin) {
     const used=new Set([...room.players.values()].map(p=>p.slot));let slot=0;while(used.has(slot))slot++;
-    if(slot>=4||room.protocol===6&&room.finalizedAt!=null)return null;
+    if(slot>=4||room.protocol>=6&&room.finalizedAt!=null)return null;
     // Reserve space both for the replaced bot and this guest's eventual
     // disconnected row. Old clients retain their exact admission behavior.
-    if(room.protocol===6 && slot!==0 && room.retirements+2+[...room.players.values()].filter(p=>p.slot!==0).length>128-(room.mode==='ocean'?65:24))return null;
+    if(room.protocol>=6 && slot!==0 && room.retirements+2+[...room.players.values()].filter(p=>p.slot!==0).length>128-(room.mode==='ocean'?65:24))return null;
     const token=randomBytes(32).toString('base64url');
     const identity=randomBytes(8).toString('hex'),displayName=cleanName(name);
-    if(room.protocol===6){room.history.set(identity,{slot,name:displayName});if(slot!==0)room.retirements++;}
-    room.players.set(token,{slot,identity,name:displayName,skin:room.protocol>=5?skin:Math.max(0,Math.min(31,Math.floor(Number(skin)||0))),seen:now(),lastExchange:0,input:{x:0,y:0,boost:0,chomp:0}});
-    return {code,token,slot,protocol:room.protocol,mode:room.mode,...(room.protocol>=5?{ruleset:room.ruleset}:{}),...(room.protocol===6?{team:slot%2,spawnIndex:Math.floor(slot/2),...(matchClock(room)?{matchClock:matchClock(room)}:{})}:{})};
+    if(room.protocol>=6){room.history.set(identity,{slot,name:displayName});if(slot!==0)room.retirements++;}
+    room.players.set(token,{slot,identity,name:displayName,skin:room.protocol>=5?skin:Math.max(0,Math.min(31,Math.floor(Number(skin)||0))),seen:now(),lastExchange:0,input:{x:0,y:0,boost:0,chomp:0,...(room.protocol>=8?{chompAngle:0,chompLife:0}:{})}});
+    return {code,token,slot,protocol:room.protocol,mode:room.mode,...(room.protocol>=5?{ruleset:room.ruleset}:{}),...(room.protocol>=6?{team:slot%2,spawnIndex:Math.floor(slot/2),...(matchClock(room)?{matchClock:matchClock(room)}:{})}:{})};
   }
   function removePlayer(room,token) {
     const p=room?.players.get(token);if(!p)return;
-    if(room.protocol===6&&p.slot!==0)room.retirements++;
+    if(room.protocol>=6&&p.slot!==0)room.retirements++;
     room.players.delete(token);
   }
   function outwardSnapshot(room) {
-    const s=room.snapshot;if(!s||room.protocol!==6||room.finalizedAt!=null)return s;
+    const s=room.snapshot;if(!s||room.protocol<6||room.finalizedAt!=null)return s;
     const current=new Map([...room.players.values()].map(p=>[p.slot,p.identity]));
     return {...s,matchStats:s.matchStats.map(row=>({...row,connected:row.connected&&(row.isBot?!current.has(row.slot):current.get(row.slot)===row.participantID)}))};
   }
   function leavePlayer(code,room,token) {
     const player=room?.players.get(token);if(!player)return;
-    if(player.slot===0 && !(room.protocol===6&&room.finalizedAt!=null))rooms.delete(code);
+    if(player.slot===0 && !(room.protocol>=6&&room.finalizedAt!=null))rooms.delete(code);
     else removePlayer(room,token);
-    if(room.protocol===6&&room.finalizedAt!=null&&room.players.size===0)rooms.delete(code);
+    if(room.protocol>=6&&room.finalizedAt!=null&&room.players.size===0)rooms.delete(code);
   }
   function validIdentities(room,stats) {
     return stats.every(row=>row.isBot?new RegExp(`^bot:${row.slot}(?::[1-9][0-9]*)?$`).test(row.participantID):room.history.get(row.participantID)?.slot===row.slot&&room.history.get(row.participantID)?.name===row.name);
@@ -134,13 +137,13 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
   }
   function queueState(token,e) {return {...lobbyState(),queueToken:token,mode:e.mode,ticket:e.ticket??null};}
   const validRequestID=value=>typeof value==='string'&&/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value);
-  const validConfigured=b=>rulesFor(b.protocol)&&b.ruleset===rulesFor(b.protocol).id&&Number.isSafeInteger(b.skin)&&b.skin>=0&&b.skin<=CHOMP_RULESET.maximumSkin;
+  const validConfigured=b=>rulesFor(b.protocol)&&b.ruleset===rulesFor(b.protocol).id&&Number.isSafeInteger(b.skin)&&b.skin>=0&&b.skin<=rulesFor(b.protocol).maximumSkin;
   function admissionTicketActive(e) {
     return !!e.ticket && rooms.get(e.ticket.code)?.players.has(e.ticket.token);
   }
   function publicOpen(room,mode,protocol=5,ruleset=LEGACY_RULESET.id) {
     if(!room.isPublic || room.protocol!==protocol || room.ruleset!==ruleset || room.mode!==mode || room.players.size>=4 || room.snapshot?.roundResult!=null)return false;
-    if(room.protocol===6&&room.retirements+2+[...room.players.values()].filter(p=>p.slot!==0).length>128-(room.mode==='ocean'?65:24))return false;
+    if(room.protocol>=6&&room.retirements+2+[...room.players.values()].filter(p=>p.slot!==0).length>128-(room.mode==='ocean'?65:24))return false;
     // Do not send a new guest to a host whose world stopped advancing.
     if(now()-room.worldAdvancedAt>3000)return false;
     // No late entry into a competitive round: both host elapsed time and wall time count.
@@ -168,8 +171,8 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     const path=new URL(req.url || '/', 'http://localhost').pathname;
     if (!path.startsWith('/v1/chomp/')) return false;
     expire();settleQueue();
-    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4,5,6],latestProtocol:6,mode:'private-hosted-playtest',maxPlayers:4});return true;}
-    if(path==='/v1/chomp/capabilities'&&req.method==='GET'){reply(res,200,{protocols:[1,2,3,4,5,6],rulesets:[LEGACY_RULESET.id,CHOMP_RULESET.id],catalog:CHOMP_RULESET.catalog,maximumSkin:CHOMP_RULESET.maximumSkin,immediatePublic:true,maxPlayers:4,maxRooms,competitiveJoinSeconds:CHOMP_RULESET.competitiveJoinSeconds});return true;}
+    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4,5,6,7,8],latestProtocol:8,mode:'private-hosted-playtest',maxPlayers:4});return true;}
+    if(path==='/v1/chomp/capabilities'&&req.method==='GET'){reply(res,200,{protocols:[1,2,3,4,5,6,7,8],rulesets:[LEGACY_RULESET.id,CHOMP_RULESET.id,SWIM_RULESET.id,CLAW_RULESET.id],catalog:CHOMP_RULESET.catalog,catalogs:[2,3],maximumSkin:CLAW_RULESET.maximumSkin,immediatePublic:true,maxPlayers:4,maxRooms,competitiveJoinSeconds:CHOMP_RULESET.competitiveJoinSeconds});return true;}
     if(path==='/v1/chomp/matches'&&req.method==='GET'){reply(res,200,immediateState());return true;}
     if(path==='/v1/chomp/lobbies'&&req.method==='GET'){reply(res,200,lobbyState());return true;}
     if (req.method!=='POST') {reply(res,405,{error:'Use POST.'});return true;}
@@ -243,7 +246,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         const entry=attempts.get(ip) || {start:now(),count:0};
         if (entry.count++>=60 || (!attempts.has(ip) && attempts.size>=1024)) {reply(res,429,{error:'Please wait before trying another room.'});return true;}
         attempts.set(ip,entry);
-        if (![1,2,3,4,5,6].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
+        if (![1,2,3,4,5,6,7,8].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
         if(b.protocol>=5 && (!validConfigured(b)||!modes.includes(b.mode))){reply(res,409,{error:'This ruleset or skin catalog is not supported. Update the game.'});return true;}
         let room,code;
         if (path==='/v1/chomp/rooms' ) {
@@ -252,7 +255,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         } else {code=String(b.code||'').toUpperCase();room=rooms.get(code);}
         if (!room) {reply(res,404,{error:'That room has closed. Ask the host for a new code.'});return true;}
         if(room.protocol!==b.protocol || b.protocol>=5&&room.ruleset!==b.ruleset) {reply(res,409,{error:"Update chomp chomp.io on both phones before joining this room."});return true;}
-        if(room.protocol===6 && (room.finalizedAt!=null || room.mode!=='ocean'&&now()>=room.created+180000)) {finalizeDeadline(room);reply(res,409,{error:'That match has finished. Start a new match.'});return true;}
+        if(room.protocol>=6 && (room.finalizedAt!=null || room.mode!=='ocean'&&now()>=room.created+180000)) {finalizeDeadline(room);reply(res,409,{error:'That match has finished. Start a new match.'});return true;}
         const ticket=addPlayer(code,room,b.name,b.skin);
         if(!ticket){reply(res,409,{error:'This room already has four players.'});return true;}
         reply(res,200,ticket);return true;
@@ -268,16 +271,19 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
       const input=b.input || {};
       for (const k of ['x','y','boost','chomp']) if(typeof input[k]!=='number' || !Number.isFinite(input[k])) throw new Error('Invalid controls');
       if(Math.abs(input.x)>1 || Math.abs(input.y)>1 || !Number.isSafeInteger(input.boost) || !Number.isSafeInteger(input.chomp) || input.boost<0 || input.chomp<0 || input.boost>1e9 || input.chomp>1e9) throw new Error('Invalid controls');
+      if(room.protocol>=8 && (input.chompAngle!=null && (!Number.isFinite(input.chompAngle)||Math.abs(input.chompAngle)>Math.PI) || room.protocol>=8 && input.chompLife!=null && (!Number.isSafeInteger(input.chompLife)||input.chompLife<0||input.chompLife>100000)))throw new Error('Invalid claw controls');
+      if(room.protocol>=8 && player.skin>=40 && input.chomp>player.input.chomp && (input.chompAngle==null||input.chompLife==null))throw new Error('Missing claw release');
       // Lost/repeated packets cannot replay an ability; host consumes monotonic counters once.
-      player.input={x:input.x,y:input.y,boost:Math.max(player.input.boost,input.boost),chomp:Math.max(player.input.chomp,input.chomp)};
+      const clawEvent=room.protocol>=8 ? (input.chomp>player.input.chomp ? {chompAngle:input.chompAngle??0,chompLife:input.chompLife??0}:{chompAngle:player.input.chompAngle,chompLife:player.input.chompLife}):{};
+      player.input={x:input.x,y:input.y,boost:Math.max(player.input.boost,input.boost),chomp:Math.max(player.input.chomp,input.chomp),...clawEvent};
       if(player.slot===0) {
         room.hostSeen=now();
         if(b.snapshot) {
-          if(!validateSnapshot(b.snapshot,room.protocol,room.ruleset)||(room.protocol>=3&&b.snapshot.mode!==room.mode)||room.protocol===6&&!validIdentities(room,b.snapshot.matchStats))throw new Error('Invalid world snapshot');
+          if(!validateSnapshot(b.snapshot,room.protocol,room.ruleset)||(room.protocol>=3&&b.snapshot.mode!==room.mode)||room.protocol>=6&&!validIdentities(room,b.snapshot.matchStats))throw new Error('Invalid world snapshot');
           // After the deadline, retain the last accepted combat ledger. A
           // packet already in flight can complete without reopening the match.
-          if(!(room.protocol===6&&room.snapshot?.roundResult!=null)) {
-            if(room.protocol===6) {
+          if(!(room.protocol>=6&&room.snapshot?.roundResult!=null)) {
+            if(room.protocol>=6) {
               if(room.snapshot && b.snapshot.elapsed<room.snapshot.elapsed || !monotonicMatchStats(room.snapshot?.matchStats,b.snapshot.matchStats))throw new Error('Reversed match state');
               if(room.mode==='team') {
                 const scores=[0,1].map(team=>b.snapshot.matchStats.filter(r=>r.team===team).reduce((sum,r)=>sum+r.kills,0));
@@ -287,11 +293,11 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
             if(!room.snapshot||b.snapshot.elapsed>room.snapshot.elapsed)room.worldAdvancedAt=now();room.snapshot=b.snapshot;room.revision++;
           }
           finalizeDeadline(room);
-          if(room.protocol===6&&room.snapshot?.roundResult!=null&&room.finalizedAt==null){room.snapshot=outwardSnapshot(room);room.finalizedAt=now();}
+          if(room.protocol>=6&&room.snapshot?.roundResult!=null&&room.finalizedAt==null){room.snapshot=outwardSnapshot(room);room.finalizedAt=now();}
         }
       } else if(b.snapshot) {reply(res,403,{error:'Only the host can send the world.'});return true;}
-      const players=[...room.players.values()].map(p=>({slot:p.slot,identity:p.identity,name:p.name,skin:p.skin,...(room.protocol===6?{team:p.slot%2,spawnIndex:Math.floor(p.slot/2)}:{}),input:now()-p.seen>1200?{...p.input,x:0,y:0}:p.input}));
-      reply(res,200,{revision:room.revision,players,snapshot:player.slot===0&&!(room.protocol===6&&room.snapshot?.roundResult!=null)?null:outwardSnapshot(room),...(matchClock(room)?{matchClock:matchClock(room)}:{}),...(room.protocol===6?{roundResult:room.snapshot?.roundResult??null}:{})});return true;
+      const players=[...room.players.values()].map(p=>({slot:p.slot,identity:p.identity,name:p.name,skin:p.skin,...(room.protocol>=6?{team:p.slot%2,spawnIndex:Math.floor(p.slot/2)}:{}),input:now()-p.seen>1200?{...p.input,x:0,y:0}:p.input}));
+      reply(res,200,{revision:room.revision,players,snapshot:player.slot===0&&!(room.protocol>=6&&room.snapshot?.roundResult!=null)?null:outwardSnapshot(room),...(matchClock(room)?{matchClock:matchClock(room)}:{}),...(room.protocol>=6?{roundResult:room.snapshot?.roundResult??null}:{})});return true;
     } catch(error) {reply(res,400,{error:'Invalid or oversized room request.'});return true;}
   };
 }
