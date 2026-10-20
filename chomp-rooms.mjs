@@ -5,7 +5,10 @@ const LEGACY_RULESET=Object.freeze({...CHOMP_RULESET,protocol:5,id:'chomp-quarte
 export const SWIM_RULESET=Object.freeze({...CHOMP_RULESET,protocol:7,id:'chomp-swim-v3'});
 export const CLAW_RULESET=Object.freeze({...SWIM_RULESET,protocol:8,id:'chomp-claws-v4',catalog:3,maximumSkin:42});
 export const ELIMINATION_RULESET=Object.freeze({...CLAW_RULESET,protocol:9,id:'chomp-elimination-v5'});
-const rulesFor=protocol=>protocol===9?ELIMINATION_RULESET:protocol===8?CLAW_RULESET:protocol===7?SWIM_RULESET:protocol===6?CHOMP_RULESET:protocol===5?LEGACY_RULESET:null;
+export const ENDLESS_RULESET=Object.freeze({...ELIMINATION_RULESET,protocol:10,id:'chomp-endless-v6'});
+const rulesFor=protocol=>protocol===10?ENDLESS_RULESET:protocol===9?ELIMINATION_RULESET:protocol===8?CLAW_RULESET:protocol===7?SWIM_RULESET:protocol===6?CHOMP_RULESET:protocol===5?LEGACY_RULESET:null;
+const endlessKing=value=>value.protocol===10&&value.mode==='king';
+const timedRoom=room=>room.protocol>=6&&room.mode!=='ocean'&&!endlessKing(room);
 
 // Private and public, short-lived playtest relay. The host phone owns the simulation.
 // No accounts, wallet, database, billing, or other game state is accessed.
@@ -25,7 +28,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         if(now()-room.finalizedAt>60000||room.players.size===0)rooms.delete(code);
         continue;
       }
-      if (now() - room.hostSeen > 12000 || now() - room.created > 3600000) { rooms.delete(code); continue; }
+      if (now() - room.hostSeen > 12000 || !endlessKing(room)&&now() - room.created > 3600000) { rooms.delete(code); continue; }
       for (const [token, player] of room.players) if (player.slot !== 0 && now() - player.seen > 12000) removePlayer(room,token);
     }
     for (const [requestID, entry] of admissions) if(now()-entry.created>admissionLifetime)admissions.delete(requestID);
@@ -45,9 +48,9 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
       if(!Array.isArray(s.mines) || s.mines.length>40 || !s.mines.every(m=>Number.isSafeInteger(m.id)&&m.position&&finite(m.position.x)&&finite(m.position.y)))return false;
       if(!s.food.every(f=>Array.isArray(f)&&f.length===5&&f.every(Number.isSafeInteger)&&f[3]>0&&f[3]<=100000000&&f[4]>=0&&f[4]<=(protocol>=3?8:6)))return false;
     }
-    if(protocol>=3 && (!['ocean','king','deathmatch','team'].includes(s.mode)||!Array.isArray(s.crownTimes)||s.crownTimes.length!==s.fish.length||!s.crownTimes.every(n=>finite(n)&&n>=0&&n<=181)||s.roundResult!=null&&(typeof s.roundResult!=='string'||s.roundResult.length>64)))return false;
+    if(protocol>=3 && (!['ocean','king','deathmatch','team'].includes(s.mode)||!Array.isArray(s.crownTimes)||s.crownTimes.length!==s.fish.length||!s.crownTimes.every(n=>finite(n)&&n>=0&&n<=(endlessKing(s)?s.elapsed+0.1:181))||s.roundResult!=null&&(typeof s.roundResult!=='string'||s.roundResult.length>64)))return false;
     if(protocol>=5) {
-      if(s.elapsed<0 || s.elapsed>3600 || !s.surface.displacement.every(finite) || !s.surface.velocity.every(finite))return false;
+      if(s.elapsed<0 || (endlessKing(s)?!finite(s.elapsed):s.elapsed>3600) || !s.surface.displacement.every(finite) || !s.surface.velocity.every(finite))return false;
       if(!s.fish.every(f=>Number.isSafeInteger(f.skinID)&&f.skinID>=0&&f.skinID<=rulesFor(protocol).maximumSkin))return false;
     }
     if(protocol>=9) {
@@ -58,6 +61,14 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     if(protocol>=8 && !s.fish.every(f=>f.clawAngle==null || Number.isFinite(f.clawAngle)&&Math.abs(f.clawAngle)<=Math.PI))return false;
     if(protocol>=6 && (!s.fish.every(f=>Number.isSafeInteger(f.kills)&&f.kills>=0&&f.kills<=100000&&Number.isSafeInteger(f.deaths)&&f.deaths>=0&&f.deaths<=100000)||!validMatchStats(s.matchStats,s.fish.length,s.mode)))return false;
     if(protocol>=6&&!s.matchStats.filter(r=>r.connected).every(r=>s.fish[r.slot].kills===r.kills&&s.fish[r.slot].deaths===r.deaths&&s.fish[r.slot].name===r.name))return false;
+    if(protocol===10) {
+      if(!s.fish.every(f=>finite(f.growthCredit)&&f.growthCredit>=0&&f.growthCredit<=1+100000000/4096+1/8192+1))return false;
+      if(Object.hasOwn(s,'bestCrownTimes'))return false; // Personal bests are device-only.
+      if(endlessKing(s)) {
+        const holder=crownHolder(s);
+        if(s.roundResult!=null||!s.crownTimes.every((n,i)=>i===holder||n===0))return false;
+      } else if(s.crownTimes.some(n=>n!==0))return false;
+    }
     return true;
   }
   function validMatchStats(stats,count,mode) {
@@ -77,6 +88,25 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     return previous.every(old=>{const value=rows.get(old.participantID);return value&&value.slot===old.slot&&value.team===old.team&&value.isBot===old.isBot&&value.name===old.name&&value.kills>=old.kills&&value.deaths>=old.deaths&&(!value.connected||old.connected);});
   }
   const living=f=>f.mass>0 && f.headPresent===true && f.respawnTime===0;
+  function crownHolder(s) {
+    let holder=null;
+    for(const f of s.fish)if(living(f)&&(holder===null||f.mass>s.fish[holder].mass||f.mass===s.fish[holder].mass&&f.id<holder))holder=f.id;
+    return holder;
+  }
+  function validCrownTransition(previous,next) {
+    if(!previous)return true;
+    const delta=next.elapsed-previous.elapsed,tolerance=0.1;
+    if(delta<0)return false;
+    const before=new Map(previous.matchStats.filter(r=>r.connected).map(r=>[r.slot,r.participantID]));
+    const after=new Map(next.matchStats.filter(r=>r.connected).map(r=>[r.slot,r.participantID]));
+    const oldHolder=crownHolder(previous);
+    return next.fish.every((f,i)=>{
+      const same=before.has(i)&&before.get(i)===after.get(i);
+      const oldCurrent=same&&oldHolder===i?previous.crownTimes[i]:0;
+      const sameLife=same&&f.deaths===previous.fish[i].deaths;
+      return next.crownTimes[i]<=(sameLife?oldCurrent:0)+delta+tolerance;
+    });
+  }
   function eliminationResult(s,deadline) {
     const alive=[0,1].map(team=>s.fish.filter(f=>f.id%2===team&&living(f)).length);
     if(alive[0]===0&&alive[1]===0)return 'DRAW';
@@ -84,9 +114,9 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     const scores=alive[0]===alive[1]&&deadline? [0,1].map(team=>s.matchStats.filter(r=>r.team===team).reduce((n,r)=>n+r.kills,0)):alive;
     return scores[0]===scores[1]?'DRAW':scores[0]>scores[1]?'BLUE TEAM WINS':'RED TEAM WINS';
   }
-  function matchClock(room) {return room.protocol>=6&&room.mode!=='ocean'?{serverTime:now(),startsAt:room.created,endsAt:room.created+180000}:null;}
+  function matchClock(room) {return timedRoom(room)?{serverTime:now(),startsAt:room.created,endsAt:room.created+180000}:null;}
   function finalizeDeadline(room) {
-    const s=room.snapshot;if(room.protocol<6||room.mode==='ocean'||!s||s.roundResult!=null)return;
+    const s=room.snapshot;if(!timedRoom(room)||!s||s.roundResult!=null)return;
     if(room.protocol>=9&&room.mode==='team') {
       const result=eliminationResult(s,now()>=room.created+180000);if(result==null)return;
       s.roundResult=result;room.snapshot=outwardSnapshot(room);room.finalizedAt=now();room.revision++;return;
@@ -167,7 +197,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     // Do not send a new guest to a host whose world stopped advancing.
     if(now()-room.worldAdvancedAt>3000)return false;
     // No late entry into a competitive round: both host elapsed time and wall time count.
-    return mode==='ocean' || Math.max((now()-room.created)/1000,room.snapshot?.elapsed??0)<CHOMP_RULESET.competitiveJoinSeconds;
+    return mode==='ocean' || endlessKing(room) || Math.max((now()-room.created)/1000,room.snapshot?.elapsed??0)<CHOMP_RULESET.competitiveJoinSeconds;
   }
   function immediateState(protocol=5,ruleset=LEGACY_RULESET.id) {
     return {serverTime:now(),intervalSeconds:0,modes:modes.map(mode=>({mode,startsAt:now(),queued:0,capacity:4,capacityWait:rooms.size>=maxRooms&&![...rooms.values()].some(r=>publicOpen(r,mode,protocol,ruleset)),humans:[...rooms.values()].filter(r=>r.isPublic&&r.protocol>=5&&r.mode===mode).reduce((sum,r)=>sum+r.players.size,0)}))};
@@ -191,8 +221,8 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     const path=new URL(req.url || '/', 'http://localhost').pathname;
     if (!path.startsWith('/v1/chomp/')) return false;
     expire();settleQueue();
-    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4,5,6,7,8,9],latestProtocol:9,mode:'private-hosted-playtest',maxPlayers:4});return true;}
-    if(path==='/v1/chomp/capabilities'&&req.method==='GET'){reply(res,200,{protocols:[1,2,3,4,5,6,7,8,9],rulesets:[LEGACY_RULESET.id,CHOMP_RULESET.id,SWIM_RULESET.id,CLAW_RULESET.id,ELIMINATION_RULESET.id],catalog:CHOMP_RULESET.catalog,catalogs:[2,3],maximumSkin:CLAW_RULESET.maximumSkin,immediatePublic:true,maxPlayers:4,maxRooms,competitiveJoinSeconds:CHOMP_RULESET.competitiveJoinSeconds});return true;}
+    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4,5,6,7,8,9,10],latestProtocol:10,mode:'private-hosted-playtest',maxPlayers:4});return true;}
+    if(path==='/v1/chomp/capabilities'&&req.method==='GET'){reply(res,200,{protocols:[1,2,3,4,5,6,7,8,9,10],rulesets:[LEGACY_RULESET.id,CHOMP_RULESET.id,SWIM_RULESET.id,CLAW_RULESET.id,ELIMINATION_RULESET.id,ENDLESS_RULESET.id],catalog:CHOMP_RULESET.catalog,catalogs:[2,3],maximumSkin:CLAW_RULESET.maximumSkin,immediatePublic:true,maxPlayers:4,maxRooms,competitiveJoinSeconds:CHOMP_RULESET.competitiveJoinSeconds,endlessKingProtocols:[10]});return true;}
     if(path==='/v1/chomp/matches'&&req.method==='GET'){reply(res,200,immediateState());return true;}
     if(path==='/v1/chomp/lobbies'&&req.method==='GET'){reply(res,200,lobbyState());return true;}
     if (req.method!=='POST') {reply(res,405,{error:'Use POST.'});return true;}
@@ -266,7 +296,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         const entry=attempts.get(ip) || {start:now(),count:0};
         if (entry.count++>=60 || (!attempts.has(ip) && attempts.size>=1024)) {reply(res,429,{error:'Please wait before trying another room.'});return true;}
         attempts.set(ip,entry);
-        if (![1,2,3,4,5,6,7,8,9].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
+        if (![1,2,3,4,5,6,7,8,9,10].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
         if(b.protocol>=5 && (!validConfigured(b)||!modes.includes(b.mode))){reply(res,409,{error:'This ruleset or skin catalog is not supported. Update the game.'});return true;}
         let room,code;
         if (path==='/v1/chomp/rooms' ) {
@@ -276,7 +306,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         if (!room) {reply(res,404,{error:'That room has closed. Ask the host for a new code.'});return true;}
         if(room.protocol!==b.protocol || b.protocol>=5&&room.ruleset!==b.ruleset) {reply(res,409,{error:"Update chomp chomp.io on both phones before joining this room."});return true;}
         if(room.protocol>=9&&!allowedSkin(room.protocol,b.skin,room.mode)){reply(res,409,{error:'Crabs are available in Ocean only.'});return true;}
-        if(room.protocol>=6 && (room.finalizedAt!=null || room.mode!=='ocean'&&now()>=room.created+180000)) {finalizeDeadline(room);reply(res,409,{error:'That match has finished. Start a new match.'});return true;}
+        if(room.protocol>=6 && (room.finalizedAt!=null || timedRoom(room)&&now()>=room.created+180000)) {finalizeDeadline(room);reply(res,409,{error:'That match has finished. Start a new match.'});return true;}
         const ticket=addPlayer(code,room,b.name,b.skin);
         if(!ticket){reply(res,409,{error:'This room already has four players.'});return true;}
         reply(res,200,ticket);return true;
@@ -306,6 +336,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
           if(!(room.protocol>=6&&room.snapshot?.roundResult!=null)) {
             if(room.protocol>=6) {
               if(room.snapshot && b.snapshot.elapsed<room.snapshot.elapsed || !monotonicMatchStats(room.snapshot?.matchStats,b.snapshot.matchStats))throw new Error('Reversed match state');
+              if(endlessKing(room)&&!validCrownTransition(room.snapshot,b.snapshot))throw new Error('Invalid crown transition');
               if(room.protocol>=9&&room.mode==='team') {
                 if(room.snapshot && room.snapshot.fish.some((f,i)=>!living(f)&&living(b.snapshot.fish[i])))throw new Error('Eliminated slots cannot respawn');
                 b.snapshot.roundResult=eliminationResult(b.snapshot,now()>=room.created+180000);
