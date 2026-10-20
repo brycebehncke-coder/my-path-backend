@@ -6,8 +6,9 @@ export const SWIM_RULESET=Object.freeze({...CHOMP_RULESET,protocol:7,id:'chomp-s
 export const CLAW_RULESET=Object.freeze({...SWIM_RULESET,protocol:8,id:'chomp-claws-v4',catalog:3,maximumSkin:42});
 export const ELIMINATION_RULESET=Object.freeze({...CLAW_RULESET,protocol:9,id:'chomp-elimination-v5'});
 export const ENDLESS_RULESET=Object.freeze({...ELIMINATION_RULESET,protocol:10,id:'chomp-endless-v6'});
-const rulesFor=protocol=>protocol===10?ENDLESS_RULESET:protocol===9?ELIMINATION_RULESET:protocol===8?CLAW_RULESET:protocol===7?SWIM_RULESET:protocol===6?CHOMP_RULESET:protocol===5?LEGACY_RULESET:null;
-const endlessKing=value=>value.protocol===10&&value.mode==='king';
+export const OCEAN_RULESET=Object.freeze({...ENDLESS_RULESET,protocol:11,id:'chomp-ocean-v7'});
+const rulesFor=protocol=>protocol===11?OCEAN_RULESET:protocol===10?ENDLESS_RULESET:protocol===9?ELIMINATION_RULESET:protocol===8?CLAW_RULESET:protocol===7?SWIM_RULESET:protocol===6?CHOMP_RULESET:protocol===5?LEGACY_RULESET:null;
+const endlessKing=value=>(value.protocol===10||value.protocol===11)&&value.mode==='king';
 const timedRoom=room=>room.protocol>=6&&room.mode!=='ocean'&&!endlessKing(room);
 
 // Private and public, short-lived playtest relay. The host phone owns the simulation.
@@ -38,7 +39,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
   function validateSnapshot(s, protocol, ruleset) {
     if(protocol>=5 && (ruleset!==rulesFor(protocol)?.id || s?.ruleset!==ruleset))return false;
     if (!s || s.protocol !== protocol || !Number.isFinite(s.elapsed) || !Array.isArray(s.fish) || s.fish.length !== (protocol>=4&&s.mode!=='ocean'?24:protocol>=2?65:29) || !Array.isArray(s.food) || s.food.length > (protocol>=3?2400:protocol===2?6000:1800) || !Array.isArray(s.circles) || s.circles.length > 12) return false;
-    if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== (protocol>=4&&s.mode!=='ocean'?(protocol>=5?(protocol>=6&&s.mode==='team'?305:431):609):860) || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== s.surface.displacement.length) return false;
+    if (!s.surface || !Array.isArray(s.surface.displacement) || s.surface.displacement.length !== (protocol>=4&&s.mode!=='ocean'?(protocol>=5?(protocol>=6&&s.mode==='team'?305:431):609):protocol===11?1216:860) || !Array.isArray(s.surface.velocity) || s.surface.velocity.length !== s.surface.displacement.length) return false;
     const finite = n => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) < 1e12;
     for (let i=0;i<s.fish.length;i++) {
       const f=s.fish[i];
@@ -61,7 +62,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     if(protocol>=8 && !s.fish.every(f=>f.clawAngle==null || Number.isFinite(f.clawAngle)&&Math.abs(f.clawAngle)<=Math.PI))return false;
     if(protocol>=6 && (!s.fish.every(f=>Number.isSafeInteger(f.kills)&&f.kills>=0&&f.kills<=100000&&Number.isSafeInteger(f.deaths)&&f.deaths>=0&&f.deaths<=100000)||!validMatchStats(s.matchStats,s.fish.length,s.mode)))return false;
     if(protocol>=6&&!s.matchStats.filter(r=>r.connected).every(r=>s.fish[r.slot].kills===r.kills&&s.fish[r.slot].deaths===r.deaths&&s.fish[r.slot].name===r.name))return false;
-    if(protocol===10) {
+    if(protocol===10||protocol===11) {
       if(!s.fish.every(f=>finite(f.growthCredit)&&f.growthCredit>=0&&f.growthCredit<=1+100000000/4096+1/8192+1))return false;
       if(Object.hasOwn(s,'bestCrownTimes'))return false; // Personal bests are device-only.
       if(endlessKing(s)) {
@@ -221,8 +222,8 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
     const path=new URL(req.url || '/', 'http://localhost').pathname;
     if (!path.startsWith('/v1/chomp/')) return false;
     expire();settleQueue();
-    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4,5,6,7,8,9,10],latestProtocol:10,mode:'private-hosted-playtest',maxPlayers:4});return true;}
-    if(path==='/v1/chomp/capabilities'&&req.method==='GET'){reply(res,200,{protocols:[1,2,3,4,5,6,7,8,9,10],rulesets:[LEGACY_RULESET.id,CHOMP_RULESET.id,SWIM_RULESET.id,CLAW_RULESET.id,ELIMINATION_RULESET.id,ENDLESS_RULESET.id],catalog:CHOMP_RULESET.catalog,catalogs:[2,3],maximumSkin:CLAW_RULESET.maximumSkin,immediatePublic:true,maxPlayers:4,maxRooms,competitiveJoinSeconds:CHOMP_RULESET.competitiveJoinSeconds,endlessKingProtocols:[10]});return true;}
+    if (path==='/v1/chomp/health' && req.method==='GET') {reply(res,200,{ok:true,protocol:4,compatibleProtocols:[1,2,3,4,5,6,7,8,9,10,11],latestProtocol:11,mode:'private-hosted-playtest',maxPlayers:4});return true;}
+    if(path==='/v1/chomp/capabilities'&&req.method==='GET'){reply(res,200,{protocols:[1,2,3,4,5,6,7,8,9,10,11],rulesets:[LEGACY_RULESET.id,CHOMP_RULESET.id,SWIM_RULESET.id,CLAW_RULESET.id,ELIMINATION_RULESET.id,ENDLESS_RULESET.id,OCEAN_RULESET.id],catalog:CHOMP_RULESET.catalog,catalogs:[2,3],maximumSkin:CLAW_RULESET.maximumSkin,immediatePublic:true,maxPlayers:4,maxRooms,competitiveJoinSeconds:CHOMP_RULESET.competitiveJoinSeconds,endlessKingProtocols:[10,11]});return true;}
     if(path==='/v1/chomp/matches'&&req.method==='GET'){reply(res,200,immediateState());return true;}
     if(path==='/v1/chomp/lobbies'&&req.method==='GET'){reply(res,200,lobbyState());return true;}
     if (req.method!=='POST') {reply(res,405,{error:'Use POST.'});return true;}
@@ -296,7 +297,7 @@ export function createChompRooms({ now = Date.now, maxRooms = 4 } = {}) {
         const entry=attempts.get(ip) || {start:now(),count:0};
         if (entry.count++>=60 || (!attempts.has(ip) && attempts.size>=1024)) {reply(res,429,{error:'Please wait before trying another room.'});return true;}
         attempts.set(ip,entry);
-        if (![1,2,3,4,5,6,7,8,9,10].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
+        if (![1,2,3,4,5,6,7,8,9,10,11].includes(b.protocol)) {reply(res,409,{error:'Update chomp chomp.io on both phones.'});return true;}
         if(b.protocol>=5 && (!validConfigured(b)||!modes.includes(b.mode))){reply(res,409,{error:'This ruleset or skin catalog is not supported. Update the game.'});return true;}
         let room,code;
         if (path==='/v1/chomp/rooms' ) {
