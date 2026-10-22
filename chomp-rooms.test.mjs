@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {createChompRooms} from './chomp-rooms.mjs';
+import {createChompRooms,validSchoolWorld,schoolPlantSites} from './chomp-rooms.mjs';
 
 async function fixture(fn,options={}) {
   const handle=createChompRooms(options);
@@ -163,7 +163,7 @@ const quarterWorld=(mode='king')=>({...newWorld(mode),protocol:5,ruleset:'chomp-
 test('v5 capability and immediate public admission need no countdown or human minimum',async()=>{
  let time=119000;await fixture(async call=>{
   const capability=(await call('/v1/chomp/capabilities')).body;
-  assert.deepEqual(capability.protocols,[1,2,3,4,5,6,7,8,9,10,11]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,42);assert.equal(capability.immediatePublic,true);
+  assert.deepEqual(capability.protocols,[1,2,3,4,5,6,7,8,9,10,11,12]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,43);assert.equal(capability.immediatePublic,true);
   const a=(await call('/v1/chomp/match',immediateJoin())).body;
   assert.equal(a.intervalSeconds,0);assert.ok(a.ticket);assert.equal(a.ticket.slot,0);assert.equal(a.ticket.ruleset,'chomp-quarter-v1');
   assert.equal(a.modes.find(m=>m.mode==='king').humans,1,'only a real person is counted; the host simulates the remaining fish as bots');
@@ -801,7 +801,7 @@ const endlessWorld=(roster,mode='king')=>{
 test('v10 King stays open after two hours; late admission, cancellation and stale host retain limits',async()=>{
  let time=100000;await fixture(async call=>{
   const caps=(await call('/v1/chomp/capabilities')).body;
-  assert.ok(caps.rulesets.includes('chomp-endless-v6'));assert.deepEqual(caps.endlessKingProtocols,[10,11]);
+  assert.ok(caps.rulesets.includes('chomp-endless-v6'));assert.deepEqual(caps.endlessKingProtocols,[10,11,12]);
   const admitted=await call('/v1/chomp/match',endlessJoin());assert.equal(admitted.status,200);
   const h=admitted.body.ticket;assert.equal(h.matchClock,undefined);
   const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
@@ -967,4 +967,85 @@ test('v11 competitive dimensions and elimination remain unchanged',async()=>{
   if(mode==='team'){const revived=structuredClone(s);Object.assign(revived.fish[1],{mass:64,headPresent:true,respawnTime:0});revived.elapsed=2;time+=130;assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:revived},h.token)).status,400);}
   for(let i=1;i<=18;i++){time=100000+i*10000;s.elapsed=i*10;const v=await call('/v1/chomp/exchange',{code:h.code,input,snapshot:s},h.token);assert.equal(v.status,200);if(i===18)assert.ok(v.body.roundResult);}
  },{now:()=>time});}
+});
+
+// Protocol12 source specifications; not executed during the source-only phase.
+const schoolJoin=(mode='ocean',i=1)=>({...expandedJoin(mode,i),protocol:12,ruleset:'chomp-school-v8',skin:43});
+const rows=(count)=>({count,rows:count?{'0':[[0,count-1]]}:{}});
+function schoolWorld(roster,mode='ocean') {
+ const s={...expandedWorld(roster,mode),protocol:12,ruleset:'chomp-school-v8',plants:mode==='ocean'?schoolPlantSites().map(({id})=>({id,readyAt:0,harvests:0})):[]};
+ for(const f of s.fish)Object.assign(f,{pixels:rows(f.mass),template:rows(f.capacity)});
+ const owner=s.fish[0];Object.assign(owner,{skinID:43,mass:120,capacity:120,gridLength:20,pixels:rows(120),template:rows(120),headPresent:true,occupiedRadius:7});
+ owner.school=Array.from({length:12},(_,i)=>({body:{id:owner.id,name:owner.name,skinID:0,schoolMemberIndex:i,mass:10,capacity:10,pixels:rows(10),template:rows(10),position:{x:0,y:0},heading:0,gridLength:10,gridHeight:1,pivot:{x:0,y:0},velocity:{x:0,y:0},occupiedRadius:7,headPresent:true,respawnTime:0,protection:0,peaceTime:0,repairAccumulator:0,growthCredit:0,kills:0,deaths:0}}));
+ return s;
+}
+test('v12 schools and plant state round-trip while v11 stays isolated',async()=>{
+ let time=100000;await fixture(async call=>{
+  const h=(await call('/v1/chomp/rooms',schoolJoin())).body;
+  assert.equal((await call('/v1/chomp/join',{...expandedJoin(),code:h.code})).status,409);
+  const g=(await call('/v1/chomp/join',{...schoolJoin(),code:h.code,name:'Guest'})).body;
+  const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
+  const s=schoolWorld(roster);s.elapsed=1;
+  assert.equal(validSchoolWorld(s),true);time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:s},h.token)).status,200);
+  assert.deepEqual((await call('/v1/chomp/exchange',{code:h.code,input},g.token)).body.snapshot,s);
+  for(const mutate of [x=>x.fish[0].school.pop(),x=>x.fish[0].school.push(x.fish[0].school[0]),x=>x.fish[0].school[0].body.school=[],x=>x.fish[0].school[0].body.mass++,x=>x.fish[0].school[0].body.position.x=10000,x=>x.fish[0].school[0].targetID=0,x=>x.fish[0].school[0].body.pixels.rows['0']=[[0,9],[8,9]],x=>x.plants[0].id++,x=>x.plants[0].readyAt=1000,x=>x.plants.push(x.plants[0]),x=>delete x.plants]) {
+   const bad=structuredClone(s);bad.elapsed=2;mutate(bad);time+=130;
+   assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:bad},h.token)).status,400);
+   assert.deepEqual((await call('/v1/chomp/exchange',{code:h.code,input},g.token)).body.snapshot,s,'rejection must retain the whole previous state');
+  }
+  const harvested=structuredClone(s);harvested.elapsed=2;harvested.plants[0].harvests=1;harvested.plants[0].readyAt=2+schoolPlantSites()[0].delay;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:harvested},h.token)).status,200);
+  const rewind=structuredClone(s);rewind.elapsed=3;time+=130;
+  assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:rewind},h.token)).status,400);
+ },{now:()=>time});
+});
+test('v12 school joins competitive games but cannot target allies or self',async()=>{
+ for(const mode of ['team','deathmatch','king']) {
+  let time=100000;await fixture(async call=>{
+   const admitted=await call('/v1/chomp/rooms',schoolJoin(mode));assert.equal(admitted.status,200);const h=admitted.body;
+   assert.equal((await call('/v1/chomp/rooms',{...schoolJoin(mode,8),skin:40})).status,409);
+   const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
+   const s=schoolWorld(roster,mode);s.elapsed=1;if(mode==='king')s.crownTimes=s.crownTimes.map(()=>0);
+   s.fish[0].school[0].targetID=1;time+=130;
+   assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:s},h.token)).status,200);
+   for(const target of mode==='team'?[0,2,24]:[0,24]) {
+    const bad=structuredClone(s);bad.elapsed=2;bad.fish[0].school[0].targetID=target;time+=130;
+    assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:bad},h.token)).status,400);
+   }
+  },{now:()=>time});
+ }
+});
+
+test('real Swift school snapshots match relay representation and bounds',{skip:!process.env.CHOMP_SCHOOL_FIXTURE_DIR},async()=>{
+ const {readFile}=await import('node:fs/promises');const {join}=await import('node:path');
+ for(const mode of ['ocean','king','deathmatch','team']) {
+  const raw=await readFile(join(process.env.CHOMP_SCHOOL_FIXTURE_DIR,'school-'+mode+'.json'),'utf8');
+  assert.ok(Buffer.byteLength(raw)<750000);assert.equal(validSchoolWorld(JSON.parse(raw)),true,mode+' Swift Codable rows, member budgets and plant IDs');
+ }
+});
+
+// Only room identities change here: body rows, member offsets, plants and all
+// gameplay fields are the actual Swift encoder output from four large schools.
+test('real Swift four-school worlds survive full local HTTP exchange in every mode',{skip:!process.env.CHOMP_SCHOOL_FIXTURE_DIR},async()=>{
+ const {readFile}=await import('node:fs/promises');const {join}=await import('node:path');
+ for(const mode of ['ocean','king','deathmatch','team']) {
+  const s=JSON.parse(await readFile(join(process.env.CHOMP_SCHOOL_FIXTURE_DIR,'school-'+mode+'.json'),'utf8'));
+  let time=100000;
+  await fixture(async call=>{
+   const admitted=await call('/v1/chomp/rooms',{...schoolJoin(mode),name:s.fish[0].name});assert.equal(admitted.status,200);const h=admitted.body;
+   const guests=[];
+   for(let i=1;i<4;i++) {const joined=await call('/v1/chomp/join',{...schoolJoin(mode,i+1),name:s.fish[i].name,code:h.code});assert.equal(joined.status,200);guests.push(joined.body);}
+   const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
+   for(const row of s.matchStats) {const p=roster.find(p=>p.slot===row.slot);if(p)Object.assign(row,{participantID:p.identity,isBot:false});}
+   const body={code:h.code,input,snapshot:s};assert.ok(Buffer.byteLength(JSON.stringify(body))<786432);
+   time+=130;assert.equal((await call('/v1/chomp/exchange',body,h.token)).status,200,mode+' accepts exact Swift geometry');
+   // The team referee explicitly encodes its unfinished result as null (Swift omits nil).
+   const expected=mode==='team'?{...s,roundResult:null}:s;
+   for(const g of guests) {const received=await call('/v1/chomp/exchange',{code:h.code,input},g.token);assert.equal(received.status,200);assert.deepEqual(received.body.snapshot,expected);}
+   // An oversized request cannot replace the previously accepted world.
+   time+=130;assert.equal((await call('/v1/chomp/exchange',{...body,padding:'x'.repeat(786432)},h.token)).status,400);
+   time+=130;assert.deepEqual((await call('/v1/chomp/exchange',{code:h.code,input},guests[0].token)).body.snapshot,expected);
+  },{now:()=>time});
+ }
 });
