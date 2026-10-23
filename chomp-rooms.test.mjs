@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
-import {createChompRooms,validSchoolWorld,schoolPlantSites} from './chomp-rooms.mjs';
+import {createChompRooms,validSchoolWorld,schoolPlantSites,reefPlantSites,reefPlantCells} from './chomp-rooms.mjs';
 
 async function fixture(fn,options={}) {
   const handle=createChompRooms(options);
@@ -163,7 +163,7 @@ const quarterWorld=(mode='king')=>({...newWorld(mode),protocol:5,ruleset:'chomp-
 test('v5 capability and immediate public admission need no countdown or human minimum',async()=>{
  let time=119000;await fixture(async call=>{
   const capability=(await call('/v1/chomp/capabilities')).body;
-  assert.deepEqual(capability.protocols,[1,2,3,4,5,6,7,8,9,10,11,12]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,43);assert.equal(capability.immediatePublic,true);
+  assert.deepEqual(capability.protocols,[1,2,3,4,5,6,7,8,9,10,11,12,13]);assert.ok(capability.rulesets.includes('chomp-quarter-v1'));assert.equal(capability.maximumSkin,43);assert.equal(capability.immediatePublic,true);
   const a=(await call('/v1/chomp/match',immediateJoin())).body;
   assert.equal(a.intervalSeconds,0);assert.ok(a.ticket);assert.equal(a.ticket.slot,0);assert.equal(a.ticket.ruleset,'chomp-quarter-v1');
   assert.equal(a.modes.find(m=>m.mode==='king').humans,1,'only a real person is counted; the host simulates the remaining fish as bots');
@@ -801,7 +801,7 @@ const endlessWorld=(roster,mode='king')=>{
 test('v10 King stays open after two hours; late admission, cancellation and stale host retain limits',async()=>{
  let time=100000;await fixture(async call=>{
   const caps=(await call('/v1/chomp/capabilities')).body;
-  assert.ok(caps.rulesets.includes('chomp-endless-v6'));assert.deepEqual(caps.endlessKingProtocols,[10,11,12]);
+  assert.ok(caps.rulesets.includes('chomp-endless-v6'));assert.deepEqual(caps.endlessKingProtocols,[10,11,12,13]);
   const admitted=await call('/v1/chomp/match',endlessJoin());assert.equal(admitted.status,200);
   const h=admitted.body.ticket;assert.equal(h.matchClock,undefined);
   const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
@@ -1031,11 +1031,12 @@ test('real Swift four-school worlds survive full local HTTP exchange in every mo
  const {readFile}=await import('node:fs/promises');const {join}=await import('node:path');
  for(const mode of ['ocean','king','deathmatch','team']) {
   const s=JSON.parse(await readFile(join(process.env.CHOMP_SCHOOL_FIXTURE_DIR,'school-'+mode+'.json'),'utf8'));
+  const currentJoin={...schoolJoin(mode),protocol:s.protocol,ruleset:s.ruleset};
   let time=100000;
   await fixture(async call=>{
-   const admitted=await call('/v1/chomp/rooms',{...schoolJoin(mode),name:s.fish[0].name});assert.equal(admitted.status,200);const h=admitted.body;
+   const admitted=await call('/v1/chomp/rooms',{...currentJoin,name:s.fish[0].name});assert.equal(admitted.status,200);const h=admitted.body;
    const guests=[];
-   for(let i=1;i<4;i++) {const joined=await call('/v1/chomp/join',{...schoolJoin(mode,i+1),name:s.fish[i].name,code:h.code});assert.equal(joined.status,200);guests.push(joined.body);}
+   for(let i=1;i<4;i++) {const joined=await call('/v1/chomp/join',{...currentJoin,name:s.fish[i].name,code:h.code});assert.equal(joined.status,200);guests.push(joined.body);}
    const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
    for(const row of s.matchStats) {const p=roster.find(p=>p.slot===row.slot);if(p)Object.assign(row,{participantID:p.identity,isBot:false});}
    const body={code:h.code,input,snapshot:s};assert.ok(Buffer.byteLength(JSON.stringify(body))<786432);
@@ -1048,4 +1049,40 @@ test('real Swift four-school worlds survive full local HTTP exchange in every mo
    time+=130;assert.deepEqual((await call('/v1/chomp/exchange',{code:h.code,input},guests[0].token)).body.snapshot,expected);
   },{now:()=>time});
  }
+});
+
+test('v13 isolates fish-only rooms and round-trips individual plant cells in every mode',async()=>{
+ for(const mode of ['ocean','king','deathmatch','team']) {
+  let time=100000;
+  await fixture(async call=>{
+   const cfg={...schoolJoin(mode),protocol:13,ruleset:'chomp-reef-v9'};
+   for(const skin of [40,41,42])assert.equal((await call('/v1/chomp/rooms',{...cfg,skin})).status,409);
+   const h=(await call('/v1/chomp/rooms',cfg)).body;
+   assert.equal((await call('/v1/chomp/join',{...schoolJoin(mode),code:h.code})).status,409);
+   const g=(await call('/v1/chomp/join',{...cfg,code:h.code,name:'Guest'})).body;
+   const roster=(await call('/v1/chomp/exchange',{code:h.code,input},h.token)).body.players;
+   const s={...schoolWorld(roster,mode),protocol:13,ruleset:'chomp-reef-v9',elapsed:1,plants:reefPlantSites(mode).map(({id})=>({id,readyAt:0,harvests:0,eaten:[]}))};
+   const site=reefPlantSites(mode)[0];assert.ok(site.cells>10);assert.equal(reefPlantCells(site.noise).length,site.cells);
+   s.plants[0]={id:site.id,readyAt:1+site.delay,harvests:1,eaten:[0]};
+   time+=130;assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:s},h.token)).status,200);
+   const accepted=(await call('/v1/chomp/exchange',{code:h.code,input},g.token)).body.snapshot;
+   assert.deepEqual(accepted.plants[0].eaten,[0]);assert.equal(accepted.plants.length,reefPlantSites(mode).length);
+   for(const mutate of [x=>x.plants[0].eaten=[0,0],x=>x.plants[0].eaten=[-1],x=>x.plants[0].eaten=[site.cells],x=>x.plants[0].eaten=[],x=>{x.plants[0].eaten=[1];x.plants[0].harvests++},x=>x.fish[1].skinID=40]) {
+    const bad=structuredClone(s);bad.elapsed=2;mutate(bad);time+=130;
+    assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:bad},h.token)).status,400);
+    assert.deepEqual((await call('/v1/chomp/exchange',{code:h.code,input},g.token)).body.snapshot,accepted);
+   }
+   const next=structuredClone(s);next.elapsed=2;next.plants[0].eaten=[0,1];next.plants[0].harvests=2;next.plants[0].readyAt=2+site.delay;
+   time+=130;assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:next},h.token)).status,200);
+   const regrown=structuredClone(next);regrown.elapsed=next.plants[0].readyAt;regrown.plants[0].eaten=[2];regrown.plants[0].harvests++;regrown.plants[0].readyAt=regrown.elapsed+site.delay;
+   time+=130;assert.equal((await call('/v1/chomp/exchange',{code:h.code,input,snapshot:regrown},h.token)).status,200);
+  },{now:()=>time});
+ }
+});
+
+ test('Swift and relay use identical reef cell ordering and geometry',{skip:!process.env.CHOMP_SCHOOL_FIXTURE_DIR},async()=>{
+ const {readFile}=await import('node:fs/promises');const {join}=await import('node:path');
+ const shapes=JSON.parse(await readFile(join(process.env.CHOMP_SCHOOL_FIXTURE_DIR,'reef-geometry.json'),'utf8'));
+ assert.ok(shapes.length>100);
+ for(const shape of shapes)assert.deepEqual(reefPlantCells(shape.noise),shape.cells,'plant '+shape.id+' noise '+shape.noise);
 });
