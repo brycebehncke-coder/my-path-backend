@@ -4,6 +4,7 @@ import { createRemoteJWKSet, importPKCS8, jwtVerify, SignJWT } from 'jose';
 import { OAuth2Client } from 'google-auth-library';
 import { RegExpMatcher, englishDataset, englishRecommendedTransformers } from 'obscenity';
 import { D1AccountStore, sharedStoreConfiguration } from './accounts-d1.mjs';
+import { appleSignInClients } from './apple-app-identities.mjs';
 
 export class AccountError extends Error {
   constructor(code, message, status = 400) { super(message); this.code = code; this.status = status; }
@@ -340,13 +341,13 @@ export function accountConfiguration(env = process.env) {
   const encrypted = Buffer.from(env.ACCOUNT_ENCRYPTION_KEY || '', 'base64').length === 32;
   let origin;
   try { const parsed = new URL(env.ACCOUNT_PUBLIC_ORIGIN || ''); if (parsed.protocol === 'https:') origin = parsed.origin; } catch { /* not configured */ }
-  return { available: durable, apple_enabled: durable && encrypted && !!env.APPLE_SIGN_IN_KEY_ID && !!env.APPLE_SIGN_IN_PRIVATE_KEY,
+  return { available: durable, apple_enabled: durable && encrypted && appleSignInClients(env).some(client => client.keyId && client.privateKey),
     google_enabled: durable && encrypted && !!origin && !!env.GOOGLE_SIGN_IN_CLIENT_ID && !!env.GOOGLE_SIGN_IN_CLIENT_SECRET,
     origin, appleClient: env.APPLE_SIGN_IN_CLIENT_ID || 'com.brycebehncke.ageup' };
 }
 
-function protectToken(value, decrypt = false) {
-  const key = Buffer.from(process.env.ACCOUNT_ENCRYPTION_KEY || '', 'base64');
+function protectToken(value, decrypt = false, env = process.env) {
+  const key = Buffer.from(env.ACCOUNT_ENCRYPTION_KEY || '', 'base64');
   if (key.length !== 32) throw new AccountError('accounts_not_configured', 'Accounts are not configured yet.', 503);
   if (decrypt) {
     const [iv,tag,ciphertext] = value.split('.').map(x => Buffer.from(x,'base64url'));
@@ -365,36 +366,50 @@ const googleClient = () => {
   return client;
 };
 
-async function appleClientSecret() {
-  const key = await importPKCS8(process.env.APPLE_SIGN_IN_PRIVATE_KEY.replaceAll('\\n','\n'),'ES256');
-  return new SignJWT({}).setProtectedHeader({ alg:'ES256',kid:process.env.APPLE_SIGN_IN_KEY_ID })
-    .setIssuer(process.env.APPLE_SIGN_IN_TEAM_ID || 'A8S98U9VW6').setSubject(accountConfiguration().appleClient)
+async function appleClientSecret(client) {
+  const key = await importPKCS8(client.privateKey.replaceAll('\\n','\n'),'ES256');
+  return new SignJWT({}).setProtectedHeader({ alg:'ES256',kid:client.keyId })
+    .setIssuer(client.teamId).setSubject(client.clientId)
     .setAudience('https://appleid.apple.com').setIssuedAt().setExpirationTime('5m').sign(key);
 }
-export async function verifyAppleIdentity(idToken, nonce, { keys = appleKeys, audience = accountConfiguration().appleClient } = {}) {
+export async function verifyAppleIdentity(idToken, nonce, { keys = appleKeys, audience = appleSignInClients().map(client => client.clientId) } = {}) {
   const { payload } = await jwtVerify(idToken, keys, { issuer:'https://appleid.apple.com',audience,algorithms:['RS256'],maxTokenAge:'10m' });
   if (!payload.sub || payload.nonce !== nonce) throw new AccountError('identity_unverified','Apple could not verify this sign-in.',401);
   return payload;
 }
-async function verifyApple(flow, body) {
-  const claims = await verifyAppleIdentity(body.identity_token,flow.nonce);
-  const response = await fetch('https://appleid.apple.com/auth/token', { method:'POST',signal:AbortSignal.timeout(15000),
-    body:new URLSearchParams({ client_id:accountConfiguration().appleClient,client_secret:await appleClientSecret(),
+export async function verifyApple(flow, body, { env = process.env, keys = appleKeys, fetcher = fetch } = {}) {
+  const clients = appleSignInClients(env).filter(client => client.keyId && client.privateKey);
+  const claims = await verifyAppleIdentity(body.identity_token,flow.nonce,{ keys,audience:clients.map(client => client.clientId) });
+  const client = clients.find(candidate => candidate.clientId === claims.aud);
+  if (!client) throw new AccountError('identity_unverified','Apple could not verify this sign-in.',401);
+  const response = await fetcher('https://appleid.apple.com/auth/token', { method:'POST',signal:AbortSignal.timeout(15000),
+    body:new URLSearchParams({ client_id:client.clientId,client_secret:await appleClientSecret(client),
       code:body.authorization_code || '',grant_type:'authorization_code' }) });
   const tokens = await response.json();
   if (!response.ok || !tokens.refresh_token) throw new AccountError('identity_unverified','Apple sign-in did not complete. Please try again.',401);
-  const exchanged = await verifyAppleIdentity(tokens.id_token,flow.nonce);
+  const exchanged = await verifyAppleIdentity(tokens.id_token,flow.nonce,{ keys,audience:client.clientId });
   if (exchanged.sub !== claims.sub) throw new AccountError('identity_unverified','Apple identity did not match.',401);
-  return { subject:claims.sub,revokeToken:protectToken(tokens.refresh_token) };
+  return { subject:client.legacy ? claims.sub : `llc:${client.teamId}:${claims.sub}`,
+    revokeToken:protectToken(JSON.stringify({ version:1,clientId:client.clientId,token:tokens.refresh_token }),false,env) };
 }
-async function revoke(provider, encrypted) {
-  const token = protectToken(encrypted,true);
+export async function revoke(provider, encrypted, { env = process.env, fetcher = fetch } = {}) {
+  let token = protectToken(encrypted,true,env);
   if (provider === 'google') {
-    const response = await fetch('https://oauth2.googleapis.com/revoke', { method:'POST',signal:AbortSignal.timeout(15000),body:new URLSearchParams({token}) });
+    const response = await fetcher('https://oauth2.googleapis.com/revoke', { method:'POST',signal:AbortSignal.timeout(15000),body:new URLSearchParams({token}) });
     if (!response.ok && response.status !== 400) throw new AccountError('revoke_unavailable','Google could not complete account deletion. Please try again.',503);
   } else {
-    const response = await fetch('https://appleid.apple.com/auth/revoke', { method:'POST',signal:AbortSignal.timeout(15000),
-      body:new URLSearchParams({client_id:accountConfiguration().appleClient,client_secret:await appleClientSecret(),token,token_type_hint:'refresh_token'}) });
+    const clients = appleSignInClients(env);
+    let client = clients[0];
+    if (token.startsWith('{')) {
+      const saved = JSON.parse(token);
+      client = clients.find(candidate => candidate.clientId === saved.clientId);
+      if (saved.version !== 1 || !client || typeof saved.token !== 'string' || !saved.token) {
+        throw new AccountError('revoke_unavailable','Apple could not complete account deletion. Please try again.',503);
+      }
+      token = saved.token;
+    }
+    const response = await fetcher('https://appleid.apple.com/auth/revoke', { method:'POST',signal:AbortSignal.timeout(15000),
+      body:new URLSearchParams({client_id:client.clientId,client_secret:await appleClientSecret(client),token,token_type_hint:'refresh_token'}) });
     if (!response.ok) throw new AccountError('revoke_unavailable','Apple could not complete account deletion. Please try again.',503);
   }
 }

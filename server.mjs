@@ -11,6 +11,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { verifyAssertion, verifyAttestation } from 'node-app-attest';
+import { verifySupportedAgeUpProof } from './apple-app-identities.mjs';
 import { GoogleAuth } from 'google-auth-library';
 import { createJackpotGateway } from './jackpot-gateway.mjs';
 import { AccountError, handleAccountRequest, googleSignInCallback, customLifeReceipt, withDiscoveryTitle } from './accounts.mjs';
@@ -54,10 +55,6 @@ const playerQuotaSigningSecret = (process.env.PLAYER_QUOTA_SIGNING_SECRET || '')
   || createHash('sha256')
     .update(`my-path-quota-v1\0${openaiApiKey}\0${deepSeekApiKey}`)
     .digest('hex');
-const appAttestTeamIdentifier = (process.env.APP_ATTEST_TEAM_ID || '').trim()
-  || 'A8S98U9VW6';
-const appAttestBundleIdentifier = (process.env.APP_ATTEST_BUNDLE_ID || '').trim()
-  || 'com.brycebehncke.ageup';
 const appAttestRequiredBuild = configuredPositiveInteger(
   process.env.APP_ATTEST_REQUIRED_BUILD,
   172,
@@ -787,12 +784,10 @@ function verifyAppAttestRequest({
 
   let result;
   try {
-    result = assertionVerifier({
+    result = verifySupportedAgeUpProof(assertionVerifier, {
       assertion,
       payload: appAttestClientData(challengeState.c, req.method, pathname, rawBody),
       publicKey: keyRecord.publicKey,
-      bundleIdentifier: appAttestBundleIdentifier,
-      teamIdentifier: appAttestTeamIdentifier,
       signCount: keyRecord.signCount,
     });
   } catch (error) {
@@ -2704,12 +2699,10 @@ const server = createServer(async (req, res) => {
       }
 
       try {
-        const verified = verifyAttestation({
+        const verified = verifySupportedAgeUpProof(verifyAttestation, {
           attestation,
           challenge: Buffer.from(challengeState.c, 'base64url'),
           keyId,
-          bundleIdentifier: appAttestBundleIdentifier,
-          teamIdentifier: appAttestTeamIdentifier,
           allowDevelopmentEnvironment: appAttestAllowDevelopmentEnvironment,
         });
         const record = getPlayerUsageLedger().registerAppAttestKey({
